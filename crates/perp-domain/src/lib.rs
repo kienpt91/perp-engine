@@ -17,6 +17,7 @@
 )]
 #![warn(missing_docs)]
 
+pub mod book;
 pub mod codec;
 pub mod error;
 pub mod fixed;
