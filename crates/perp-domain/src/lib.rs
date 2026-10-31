@@ -24,6 +24,8 @@ pub mod engine;
 pub mod error;
 pub mod fixed;
 pub mod margin;
+pub mod rng;
 pub mod sha256;
+pub mod traffic;
 pub mod types;
 pub mod views;
