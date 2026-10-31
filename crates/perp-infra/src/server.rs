@@ -614,6 +614,10 @@ fn render(reply: Reply) -> String {
             "storage_error",
             "the event could not be persisted; the server is stopping",
         ),
+        Reply::Applied(Err(ApiError::Degraded(_))) => protocol::err(
+            "read_only",
+            "the server is in read-only mode; queries still work, events are refused",
+        ),
         Reply::Book(Some(view)) => protocol::book_response(&view),
         Reply::Book(None) => protocol::err("unknown_market", ""),
         Reply::Account(Some(view)) => protocol::account_response(&view),

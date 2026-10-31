@@ -13,6 +13,10 @@ pub enum ApiError {
     Engine(Error),
     /// The log or snapshot store failed; the event was not applied.
     Storage(String),
+    /// The service is in degraded read-only mode (for example the log is full):
+    /// queries still work, state-changing events are refused and nothing was
+    /// logged or applied. This is recoverable by an operator and is not fatal.
+    Degraded(String),
 }
 
 impl fmt::Display for ApiError {
@@ -20,6 +24,7 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::Engine(e) => write!(f, "{e}"),
             ApiError::Storage(s) => write!(f, "storage: {s}"),
+            ApiError::Degraded(s) => write!(f, "read-only: {s}"),
         }
     }
 }
