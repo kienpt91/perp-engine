@@ -15,6 +15,10 @@ is a bug in one of them.
 | **Halt** | Fail-stop after an internal inconsistency or an operator kill switch. Later events are refused. | `Engine::is_halted` |
 | **Market** | One perpetual contract with a tick, a lot, a margin schedule and oracle/funding parameters. | `types::MarketConfig` |
 | **Price / Qty / Money** | Fixed-point values: price 1e-6 quote per base unit, quantity 1e-4 base units, money 1e-6 quote units. No floating point anywhere. | `fixed` |
+| **Price band** | Limit on how far from the mark a fill may execute: limit orders more aggressive than `mark * (1 ± band)` are rejected, market-order slippage is measured from the mark, and resting orders that drift out of the band are cancelled when the mark moves (`CancelReason::PriceBand`). | `MarketConfig::price_band_bps` |
+| **Execution-price loss** | What an order would lose by trading at resting prices instead of the mark; reserved in the margin test at order entry. | `engine::orders` |
+| **Precheck** | Look-up-only rejections that are refused before an event is logged. | `Engine::precheck` |
+| **Read-only mode** | State of the service when the log is full: queries work, events are refused, nothing is half-applied. | `ServiceError::ReadOnly` |
 | **Tick / Lot** | Smallest allowed price step and quantity step of a market. | `MarketConfig::tick`, `lot` |
 | **Notional** | `price * quantity` in money units. | `fixed::notional` |
 | **Order** | An instruction to buy or sell. Limit (GTC, IOC, FOK, post-only) or market (with a slippage limit). | `types::PlaceOrder` |
@@ -40,10 +44,11 @@ is a bug in one of them.
 | **Premium** | `(mid - index) / index`, sampled at each oracle update. | `engine::pricing` |
 | **Funding rate** | Mean premium plus interest, clamped, charged once per interval; positive means longs pay shorts. | `engine::funding` |
 | **Funding carry** | The fraction of a money unit left over after splitting a funding payment, carried to the next interval. | `Output::FundingSettled::carry` |
+| **Liquidation queue** | Accounts waiting for a maintenance check, served round-robin from a persistent cursor so that unfillable accounts cannot starve the rest. | `Engine` (`liq_cursor`) |
 | **Liquidation step** | One chunk of a position sold by an immediate-or-cancel reduce-only order at the liquidation price. | `engine::risk` |
 | **Liquidation price** | Mark moved by the liquidation band against the position, never worse than the bankruptcy price while the account is solvent. | `engine::risk` |
 | **Bankruptcy price** | The price at which closing the position leaves the account with exactly zero equity. | `engine::risk` |
-| **Insurance fund** | Exchange-owned money that pays deficits of liquidated accounts. Funded by liquidation fees and by `FundInsurance`. | `Engine::insurance_fund` |
+| **Insurance fund** | Exchange-owned money that pays the *realised* shortfall of liquidated accounts (never unrealised losses of open positions). Funded by liquidation fees and by `FundInsurance`. | `Engine::insurance_fund` |
 | **Auto-deleveraging (ADL)** | Closing a bankrupt position against opposite positions at the bankruptcy price when the fund cannot cover the deficit. Counterparties are ranked by profit ratio, then size, then account id. | `Output::Deleveraged` |
 | **Bad debt** | A loss nobody could cover. Reported, never hidden; non-zero means the venue is insolvent by that amount. | `Engine::bad_debt` |
 | **Fee pool** | Fees collected minus maker rebates paid. | `Engine::fee_pool` |
