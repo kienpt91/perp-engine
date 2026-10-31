@@ -11,9 +11,5 @@ publish.workspace = true
 [dependencies]
 perp-domain = { path = "../perp-domain" }
 
-[[bench]]
-name = "throughput"
-harness = false
-
 [lints]
 workspace = true

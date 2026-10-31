@@ -12,6 +12,10 @@ publish.workspace = true
 name = "perp-engine"
 path = "src/main.rs"
 
+[[bench]]
+name = "throughput"
+harness = false
+
 [dependencies]
 perp-domain = { path = "../perp-domain" }
 perp-app = { path = "../perp-app" }
