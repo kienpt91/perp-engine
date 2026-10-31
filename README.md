@@ -403,6 +403,19 @@ Threat model for this mode (also in [SECURITY.md](SECURITY.md)):
 * [docs/adr](docs/adr): short decision records.
 * [SECURITY.md](SECURITY.md): reporting, threat model, dependency policy.
 
+## Secrets and hooks
+
+Never commit `.env` files or credentials. Keep real values in a local, ignored `.env` and commit only a `.env.example` with placeholders; `.gitignore` already blocks common secret-like files.
+
+Install [lefthook](https://github.com/evilmartians/lefthook) and run `lefthook install` once per clone. This enables two hooks:
+
+- `pre-commit` runs `sh scripts/secret-scan.sh --staged` on what you are about to commit.
+- `pre-push` runs `sh scripts/secret-scan.sh --tree` on the whole working tree.
+
+CI additionally scans the full history. The scanner is a dependency-free shell script that looks for forbidden file names and key-shaped values, and it never prints the matched value. A reviewed false positive can be allowed in `.secret-scan-allow` with one line per file and rule (`<path> <rule>   # reason`), or on a single line with an inline `secret-scan: allow` marker.
+
+If a secret is ever committed, rotate it first (treat it as compromised), then remove it from history.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
