@@ -17,10 +17,12 @@
 )]
 #![warn(missing_docs)]
 
+pub mod account;
 pub mod book;
 pub mod codec;
 pub mod error;
 pub mod fixed;
+pub mod margin;
 pub mod sha256;
 pub mod types;
 pub mod views;
