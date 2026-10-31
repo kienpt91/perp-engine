@@ -1,0 +1,21 @@
+[package]
+name = "perp-cli"
+description = "perp-engine command line: simulate, replay, verify, dumps, TCP server. Educational; not for real funds."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "perp-engine"
+path = "src/main.rs"
+
+[dependencies]
+perp-domain = { path = "../perp-domain" }
+perp-app = { path = "../perp-app" }
+perp-infra = { path = "../perp-infra" }
+
+[lints]
+workspace = true

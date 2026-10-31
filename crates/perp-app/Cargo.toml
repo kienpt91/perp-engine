@@ -1,0 +1,19 @@
+[package]
+name = "perp-app"
+description = "Application layer: use cases and ports (event log, snapshot store, clock) around the perp-domain exchange."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+perp-domain = { path = "../perp-domain" }
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[lints]
+workspace = true

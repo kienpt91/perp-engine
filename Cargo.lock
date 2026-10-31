@@ -3,5 +3,29 @@
 version = 4
 
 [[package]]
-name = "perp-engine"
+name = "perp-app"
 version = "0.1.0"
+dependencies = [
+ "perp-domain",
+]
+
+[[package]]
+name = "perp-cli"
+version = "0.1.0"
+dependencies = [
+ "perp-app",
+ "perp-domain",
+ "perp-infra",
+]
+
+[[package]]
+name = "perp-domain"
+version = "0.1.0"
+
+[[package]]
+name = "perp-infra"
+version = "0.1.0"
+dependencies = [
+ "perp-app",
+ "perp-domain",
+]
