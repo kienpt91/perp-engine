@@ -1,0 +1,9 @@
+pre-commit:
+  commands:
+    secret-scan:
+      run: sh scripts/secret-scan.sh --staged
+
+pre-push:
+  commands:
+    secret-scan:
+      run: sh scripts/secret-scan.sh --tree
