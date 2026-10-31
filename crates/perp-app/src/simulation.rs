@@ -362,10 +362,10 @@ mod tests {
         let c = SimulationConfig {
             traffic: TrafficConfig {
                 seed: 1,
-                accounts: 120,
+                accounts: 200,
                 ..TrafficConfig::default()
             },
-            events: 60_000,
+            events: 100_000,
             checkpoint_every: 0,
             check_invariants_every: 10_000,
         };
