@@ -139,6 +139,27 @@ impl Book {
             .collect()
     }
 
+    /// Ids of resting orders that are more aggressive than `bound`: bids priced
+    /// strictly above it (`side == Buy`) or asks priced strictly below it
+    /// (`side == Sell`), best level first.
+    pub fn aggressive_ids(&self, side: Side, bound: Price) -> Vec<OrderId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut ids = Vec::new();
+        match side {
+            Side::Buy => {
+                for (_, level) in self.bids.range((Excluded(bound), Unbounded)).rev() {
+                    ids.extend(level.queue.values().copied());
+                }
+            }
+            Side::Sell => {
+                for (_, level) in self.asks.range(..bound) {
+                    ids.extend(level.queue.values().copied());
+                }
+            }
+        }
+        ids
+    }
+
     /// Insert a new resting order at the back of its level's queue.
     pub fn insert(&mut self, order: Order) -> Result<()> {
         if order.qty == 0 {
@@ -366,6 +387,27 @@ mod tests {
             b.insert(order(2, Side::Buy, 100, 1, 2)),
             Err(Error::Overflow)
         );
+    }
+
+    #[test]
+    fn aggressive_ids_selects_bids_above_and_asks_below_the_bound() {
+        let mut b = Book::new();
+        b.insert(order(1, Side::Buy, 100, 1, 1)).unwrap();
+        b.insert(order(2, Side::Buy, 105, 1, 2)).unwrap();
+        b.insert(order(3, Side::Buy, 105, 1, 3)).unwrap();
+        b.insert(order(4, Side::Buy, 110, 1, 4)).unwrap();
+        b.insert(order(5, Side::Sell, 120, 1, 5)).unwrap();
+        b.insert(order(6, Side::Sell, 125, 1, 6)).unwrap();
+        b.insert(order(7, Side::Sell, 130, 1, 7)).unwrap();
+        // bids strictly above 105: only the one at 110
+        assert_eq!(b.aggressive_ids(Side::Buy, Price(105)), vec![4]);
+        // best level first, FIFO inside a level
+        assert_eq!(b.aggressive_ids(Side::Buy, Price(100)), vec![4, 2, 3]);
+        // asks strictly below 125: only the one at 120
+        assert_eq!(b.aggressive_ids(Side::Sell, Price(125)), vec![5]);
+        assert_eq!(b.aggressive_ids(Side::Sell, Price(131)), vec![5, 6, 7]);
+        assert!(b.aggressive_ids(Side::Buy, Price(110)).is_empty());
+        assert!(b.aggressive_ids(Side::Sell, Price(120)).is_empty());
     }
 
     #[test]

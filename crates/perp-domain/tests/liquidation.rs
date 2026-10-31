@@ -232,19 +232,34 @@ fn boundary_then_one_step_down_in_the_same_run() {
 }
 
 #[test]
-fn liquidation_is_checked_after_a_fill_that_makes_the_taker_underwater() {
-    // The oracle falls to 48 000 while an old ask at 50 000 still rests. The
-    // buyer (collateral 2500) passes the margin check but the fill at 50 000
-    // leaves equity 2475 - 2000 = 475 < maintenance 1200.
-    let mut ex = Ex::new();
-    ex.fund(&[SELLER, BIDDER], 1_000_000);
-    ex.deposit(VICTIM, 2_500);
-    ex.gtc(SELLER, Side::Sell, 50_000, 1_000);
-    ex.oracle(48_000).unwrap();
-    ex.gtc(BIDDER, Side::Buy, 47_900, 2_000);
-    let outs = ex
-        .limit(VICTIM, Side::Buy, 50_000, 1_000, Tif::Ioc)
-        .unwrap();
+fn liquidation_is_checked_after_a_fill_that_touches_a_stuck_account() {
+    // The victim is underwater but nobody bids: its step runs without a fill
+    // and it leaves the queue (stuck). Placing a bid does not wake it up, but a
+    // fill of its own does: here a reduce-only IOC sell of 0.1 base into the new
+    // bid (in band, 47 400) leaves it still below maintenance and the check that
+    // follows the fill starts a new liquidation in the very same event.
+    let mut ex = long_victim(3_000);
+    let outs = ex.oracle(47_500).unwrap();
+    assert_eq!(started(&outs, VICTIM), vec![usd(475)]);
+    assert!(!any_fill(&outs));
+    assert!(!ex.engine.is_pending_liquidation(VICTIM));
+    let outs = ex.limit(BIDDER, Side::Buy, 47_400, 500, Tif::Gtc).unwrap();
+    assert!(
+        started(&outs, VICTIM).is_empty(),
+        "a resting bid is no check"
+    );
+
+    let mut p = ex.order(
+        VICTIM,
+        Side::Sell,
+        OrderKind::Limit {
+            price: px(47_400),
+            tif: Tif::Ioc,
+        },
+        100,
+    );
+    p.reduce_only = true;
+    let outs = ex.place(p).unwrap();
     let fill_pos = outs
         .iter()
         .position(|o| {
@@ -256,16 +271,22 @@ fn liquidation_is_checked_after_a_fill_that_makes_the_taker_underwater() {
                 }
             )
         })
-        .expect("opening fill");
+        .expect("closing fill");
     let start_pos = outs
         .iter()
         .position(|o| matches!(o, Output::LiquidationStarted { .. }))
         .expect("liquidation started");
     assert!(fill_pos < start_pos);
-    assert_eq!(started(&outs, VICTIM)[0], usd(475));
+    // 0.1 base sold at 47 400: realised -260, taker fee 500 ppm of 4740 = 2.37
+    // collateral 2975 - 260 - 2.37 = 2712.63; equity 2712.63 - 2250 = 462.63
+    // (the next steps start at 418.8, ... as the remainder keeps being sold)
+    assert_eq!(started(&outs, VICTIM)[0], Money(462_630_000));
+    assert_eq!(started(&outs, VICTIM)[1], Money(418_800_000));
     let lf = liq_fills(&outs);
-    assert_eq!(lf[0].qty, 2_500);
-    assert_eq!(lf[0].price, px(47_900).0);
+    // chunk: 25 % of 9000 raw = 2250 raw, hit into the same bid at 47 400
+    assert_eq!((lf[0].price, lf[0].qty), (px(47_400).0, 2_250));
+    // 0.2 % of 10 665 = 21.33
+    assert_eq!(lf[0].taker_fee, 21_330_000);
     identity(&ex);
 }
 
@@ -274,14 +295,18 @@ fn fill_at_a_healthy_price_does_not_start_a_liquidation() {
     let mut ex = Ex::new();
     ex.fund(&[SELLER, BIDDER], 1_000_000);
     ex.deposit(VICTIM, 2_500);
-    ex.gtc(SELLER, Side::Sell, 48_000, 1_000);
     ex.oracle(48_000).unwrap();
+    ex.gtc(SELLER, Side::Sell, 48_000, 1_000);
     let outs = ex
         .limit(VICTIM, Side::Buy, 48_000, 1_000, Tif::Ioc)
         .unwrap();
     assert!(any_fill(&outs));
     assert!(started(&outs, VICTIM).is_empty());
     assert!(liq_fills(&outs).is_empty());
+    // equity 2476 vs maintenance 1200
+    let v = ex.engine.account_view(VICTIM).unwrap();
+    assert_eq!(v.equity, usd(2_476));
+    assert_eq!(v.maintenance_margin, usd(1_200));
     identity(&ex);
 }
 
@@ -463,7 +488,7 @@ fn solvent_liquidation_never_fills_worse_than_the_equity_bound() {
 
 #[test]
 fn liquidation_price_is_bounded_by_the_band_for_an_insolvent_account() {
-    // insolvent (equity -2300 at 45 125); fund covers; band price is
+    // insolvent (equity -2300 at 45 125); the band price is
     // 45 125 * 0.95 = 42 868.75: a bid at 42 000 must not fill, one at 43 000 does.
     let mut ex = long_victim(2_600);
     ex.apply(EventBody::FundInsurance { amount: usd(5_000) })
@@ -471,14 +496,30 @@ fn liquidation_price_is_bounded_by_the_band_for_an_insolvent_account() {
     ex.gtc(BIDDER, Side::Buy, 42_000, 2_000);
     ex.oracle(47_500).unwrap();
     let outs = ex.oracle(45_125).unwrap();
+    assert_eq!(started(&outs, VICTIM)[0], usd(-2_300));
     assert!(liq_fills(&outs).is_empty());
-    // the fund still pays the deficit even though nothing could be sold
-    assert_eq!(paid(&outs), vec![(VICTIM, usd(2_300).0)]);
+    // nothing was realised: the fund pays nothing for the unrealised -2300
+    assert!(paid(&outs).is_empty());
+    assert_eq!(ex.engine.insurance_fund(), usd(5_000));
+    assert_eq!(ex.size(VICTIM), 10_000);
     ex.gtc(BIDDER, Side::Buy, 43_000, 2_000);
-    ex.advance(1);
     let outs = tick(&mut ex);
     let fills = liq_fills(&outs);
+    assert!(!fills.is_empty());
+    assert!(
+        fills.iter().all(|f| f.price == px(43_000).0),
+        "only the bid inside the band is hit, best price first"
+    );
     assert!(fills.iter().all(|f| f.price >= 42_868_750_000));
+    assert_eq!(fills.iter().map(|f| f.qty).sum::<u64>(), 10_000);
+    // realised: 1.0 sold at 43 000 = -7000 on collateral 2575 -> fund pays 4425
+    assert_eq!(
+        paid(&outs).iter().map(|(_, a)| a).sum::<i128>(),
+        usd(4_425).0
+    );
+    assert_eq!(ex.engine.insurance_fund(), usd(5_000 - 4_425));
+    assert!(adl(&outs).is_empty());
+    assert_eq!(ex.collateral(VICTIM), 0);
     identity(&ex);
 }
 
@@ -818,25 +859,53 @@ fn insolvent_with_fund(fund: i128) -> (Ex, Vec<Output>) {
 }
 
 #[test]
-fn insurance_fund_covers_an_insolvent_account() {
+fn insurance_fund_pays_exactly_the_realised_shortfall_while_the_book_liquidates() {
+    // Bid depth 2.0 at 45 000; the victim (collateral 2575, equity -2300 at
+    // 45 125) is sold down chunk by chunk (25 % each, rounded up to the lot):
+    // 2500, 1880, 1410, 1060, ... raw. Every raw unit sold at 45 000 realises
+    // 0.5 quote of loss (basis 5.0 per raw unit).
     let (ex, outs) = insolvent_with_fund(5_000);
-    // first started event carries the negative equity
-    let st = started(&outs, VICTIM);
-    assert_eq!(st[0], usd(-2_300));
-    // 0.25 sold at 45 000 (loss 1250), remaining 0.75 at mark 45 125
+    assert_eq!(started(&outs, VICTIM)[0], usd(-2_300));
     let fills = liq_fills(&outs);
-    assert_eq!(fills.len(), 1);
     assert_eq!(fills[0].qty, 2_500);
-    assert_eq!(fills[0].price, px(45_000).0);
-    assert_eq!(
-        fills[0].taker_fee, 0,
+    assert_eq!(fills[1].qty, 1_880);
+    assert_eq!(fills[2].qty, 1_410);
+    assert!(fills.iter().all(|f| f.price == px(45_000).0));
+    assert!(
+        fills.iter().all(|f| f.taker_fee == 0),
         "no liquidation fee on an insolvent account"
     );
-    // equity after the fill: 1325 - 3656.25 = -2331.25 paid by the fund
-    assert_eq!(paid(&outs), vec![(VICTIM, 2_331_250_000)]);
+    assert_eq!(fills.iter().map(|f| f.qty).sum::<u64>(), 10_000);
+    assert_eq!(ex.engine.position(VICTIM, M), None);
+    // collateral 2575 stays positive for the first two chunks (-1250, -940):
+    // no payment. The third chunk (-705) takes it to -320: the fund pays 320.
+    // From then on every chunk realises its whole loss on a zero balance.
+    let payments = paid(&outs);
+    assert_eq!(payments[0], (VICTIM, usd(320).0));
+    assert_eq!(payments.len(), fills.len() - 2);
+    // in total the fund pays what the sale lost beyond the collateral:
+    // 10_000 raw * 0.5 = 5000 loss - 2575 collateral = 2425
+    let total: i128 = payments.iter().map(|(_, a)| a).sum();
+    assert_eq!(total, usd(2_425).0);
+    assert_eq!(ex.engine.insurance_fund(), usd(5_000 - 2_425));
+    // the payment follows the fill of its own step directly
+    let first_pay = outs
+        .iter()
+        .position(|o| matches!(o, Output::InsurancePaid { .. }))
+        .unwrap();
+    assert!(matches!(
+        outs[first_pay - 1],
+        Output::Fill {
+            liquidation: true,
+            ..
+        }
+    ));
     assert_eq!(
-        ex.engine.insurance_fund(),
-        Money(5_000_000_000 - 2_331_250_000)
+        outs.iter()
+            .take(first_pay)
+            .filter(|o| matches!(o, Output::Fill { .. }))
+            .count(),
+        3
     );
     assert!(
         adl(&outs).is_empty(),
@@ -844,8 +913,7 @@ fn insurance_fund_covers_an_insolvent_account() {
     );
     assert_eq!(ex.engine.summary().adl_fills, 0);
     assert_eq!(ex.engine.bad_debt(), Money(0));
-    assert_eq!(ex.engine.equity(VICTIM), Some(Money(0)));
-    assert_eq!(ex.size(VICTIM), 7_500);
+    assert_eq!(ex.collateral(VICTIM), 0);
     identity(&ex);
 }
 
@@ -1003,67 +1071,111 @@ fn deleveraged_event_is_not_emitted_when_the_book_liquidates() {
 }
 
 // --- shortfall of a flat account --------------------------------------------
+//
+// A normal order can no longer realise a loss bigger than the account's
+// collateral (the price band and the `equity - adverse >= 0` entry check), so a
+// flat account with negative collateral can only come out of a liquidation. The
+// scenarios use a 0.001 base position (one lot): a liquidation chunk is then
+// the whole position.
+//
+//   deposit 3, fee 0.025 -> collateral 2.975, long 0.001 @ 50 000 (basis 50)
+//   mark 47 500: equity 0.475 < maintenance 1.1875, but the only bid (45 000)
+//                is below the solvent limit price 47 120.512 -> stuck
+//   mark 45 125: equity -1.9 (insolvent)
 
-/// A long with equity 2975 closes itself with a reduce-only IOC sell into a
-/// bid at 40 000: the realised loss (10 000 + 20 fee) exceeds its collateral.
-fn self_inflicted_shortfall(fund: i128) -> (Ex, Vec<Output>) {
-    let mut ex = long_victim(3_000);
+/// Returns the engine and the outputs of the two oracle updates.
+fn tiny_insolvent(fund: i128) -> (Ex, Vec<Output>, Vec<Output>) {
+    let mut ex = Ex::new();
+    ex.fund(&[SELLER, BIDDER], 1_000_000);
+    ex.deposit(VICTIM, 3);
     if fund > 0 {
         ex.apply(EventBody::FundInsurance { amount: usd(fund) })
             .unwrap();
     }
-    ex.gtc(BIDDER, Side::Buy, 40_000, 1_000);
-    let mut p = ex.order(
-        VICTIM,
-        Side::Sell,
-        OrderKind::Limit {
-            price: px(40_000),
-            tif: Tif::Ioc,
-        },
-        1_000,
-    );
-    p.reduce_only = true;
-    let outs = ex.place(p).unwrap();
-    (ex, outs)
+    ex.trade(VICTIM, SELLER, Side::Buy, 50_000, 1);
+    assert_eq!(ex.size(VICTIM), 10);
+    assert_eq!(ex.collateral(VICTIM), 2_975_000);
+    ex.gtc(BIDDER, Side::Buy, 45_000, 2_000);
+    let first = ex.oracle(47_500).unwrap();
+    let second = ex.oracle(45_125).unwrap();
+    (ex, first, second)
 }
 
 #[test]
 fn flat_account_with_negative_collateral_is_covered_by_the_fund() {
-    let (ex, outs) = self_inflicted_shortfall(10_000);
-    // collateral 2975 - 10000 - 20 = -7045
-    assert_eq!(paid(&outs), vec![(VICTIM, usd(7_045).0)]);
+    let (ex, first, second) = tiny_insolvent(10);
+    // 47 500: liquidation attempted, nothing sold, nothing paid
+    assert_eq!(started(&first, VICTIM), vec![Money(475_000)]);
+    assert!(liq_fills(&first).is_empty());
+    assert!(paid(&first).is_empty());
+    // 45 125: the whole position (chunk = one lot) is sold at the bid 45 000:
+    // realised -5 on collateral 2.975 -> flat with collateral -2.025
+    assert_eq!(started(&second, VICTIM), vec![Money(-1_900_000)]);
+    let fills = liq_fills(&second);
+    assert_eq!(fills.len(), 1);
+    assert_eq!((fills[0].price, fills[0].qty), (px(45_000).0, 10));
+    assert_eq!(fills[0].taker_fee, 0);
+    assert_eq!(paid(&second), vec![(VICTIM, 2_025_000)]);
     assert_eq!(ex.collateral(VICTIM), 0);
-    assert_eq!(ex.engine.insurance_fund(), usd(10_000 - 7_045));
+    assert_eq!(ex.engine.position(VICTIM, M), None);
+    assert_eq!(ex.engine.insurance_fund(), Money(10_000_000 - 2_025_000));
     assert_eq!(ex.engine.bad_debt(), Money(0));
-    assert!(
-        started(&outs, VICTIM).is_empty(),
-        "no position left to liquidate"
-    );
+    assert!(!has(&second, |o| matches!(o, Output::Deleveraged { .. })));
     identity(&ex);
 }
 
 #[test]
-fn shortfall_nobody_can_cover_is_reported_as_bad_debt() {
-    let (ex, outs) = self_inflicted_shortfall(0);
-    assert!(paid(&outs).is_empty());
-    assert_eq!(ex.engine.bad_debt(), usd(7_045));
-    assert_eq!(ex.engine.summary().bad_debt, usd(7_045));
+fn empty_fund_closes_the_tiny_position_by_adl_at_the_bankruptcy_price() {
+    let (ex, first, second) = tiny_insolvent(0);
+    assert_eq!(started(&first, VICTIM), vec![Money(475_000)]);
+    assert_eq!(started(&second, VICTIM), vec![Money(-1_900_000)]);
+    // fund (0) < deficit 1.9 + slippage 2.25625 + dust: no book liquidation;
+    // nothing to pay, bankruptcy price = entry - collateral / size = 47 025
+    assert!(liq_fills(&second).is_empty());
+    assert!(paid(&second).is_empty());
+    assert_eq!(adl(&second), vec![(VICTIM, SELLER, px(47_025).0, 10)]);
     assert_eq!(ex.collateral(VICTIM), 0);
-    // the identity holds only because bad debt is on the right-hand side
-    let e = &ex.engine;
-    assert_eq!(
-        e.total_collateral().0 + e.insurance_fund().0 + e.fee_pool().0 - e.total_basis().0,
-        e.net_deposits().0 + usd(7_045).0
-    );
-    ex.check();
+    assert_eq!(ex.engine.position(VICTIM, M), None);
+    assert_eq!(ex.engine.bad_debt(), Money(0));
+    assert_eq!(ex.engine.summary().adl_fills, 1);
+    // the short counterparty is closed at 47 025 and gains 2.975
+    assert_eq!(ex.size(SELLER), 0);
+    identity(&ex);
 }
 
 #[test]
-fn partially_covered_shortfall_splits_between_fund_and_bad_debt() {
-    let (ex, outs) = self_inflicted_shortfall(1_000);
-    assert_eq!(paid(&outs), vec![(VICTIM, usd(1_000).0)]);
-    assert_eq!(ex.engine.insurance_fund(), Money(0));
-    assert_eq!(ex.engine.bad_debt(), usd(6_045));
+fn fund_below_the_allowance_pays_the_deficit_here_and_adl_closes_at_the_mark() {
+    // allowance = 1.9 + 2.25625 + 0.000512 > 3: ADL; the fund pays
+    // min(deficit 1.9, 3) = 1.9, so the bankruptcy price equals the mark.
+    let (ex, _, second) = tiny_insolvent(3);
+    assert_eq!(paid(&second), vec![(VICTIM, 1_900_000)]);
+    assert_eq!(adl(&second), vec![(VICTIM, SELLER, px(45_125).0, 10)]);
+    assert!(liq_fills(&second).is_empty());
+    assert_eq!(ex.engine.insurance_fund(), Money(3_000_000 - 1_900_000));
+    assert_eq!(ex.collateral(VICTIM), 0);
+    assert_eq!(ex.engine.bad_debt(), Money(0));
+    identity(&ex);
+}
+
+#[test]
+fn fund_pays_only_realised_losses_never_the_unrealised_deficit() {
+    // 1.0 base long, collateral 2575, bid only 0.1 base deep at 45 000.
+    // At 45 125 the equity is -2300 but nothing is realised beyond what the
+    // 0.1 base sale loses: 0.1 * (50 000 - 45 000) = 500 < 2575 collateral.
+    let mut ex = long_victim(2_600);
+    ex.apply(EventBody::FundInsurance { amount: usd(5_000) })
+        .unwrap();
+    ex.gtc(BIDDER, Side::Buy, 45_000, 100);
+    ex.oracle(47_500).unwrap();
+    let outs = ex.oracle(45_125).unwrap();
+    assert_eq!(started(&outs, VICTIM)[0], usd(-2_300));
+    let fills = liq_fills(&outs);
+    assert_eq!(fills.len(), 1, "only 0.1 base can be sold");
+    assert_eq!((fills[0].price, fills[0].qty), (px(45_000).0, 1_000));
+    assert!(paid(&outs).is_empty(), "the unrealised -2300 is not paid");
+    assert_eq!(ex.collateral(VICTIM), usd(2_075).0);
+    assert_eq!(ex.engine.insurance_fund(), usd(5_000));
+    assert_eq!(ex.size(VICTIM), 9_000);
     identity(&ex);
 }
 

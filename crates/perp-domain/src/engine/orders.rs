@@ -5,7 +5,8 @@ use crate::account::{Account, Exposure};
 use crate::book::Order;
 use crate::error::{Error, Result};
 use crate::fixed::{
-    mul_div, notional, notional_raw, ppm_of, Money, Price, Qty, Round, BPS_SCALE, MAX_PRICE,
+    ceil_div, mul_div, notional, notional_raw, ppm_of, Money, Price, Qty, Round, BPS_SCALE,
+    MAX_PRICE, QTY_SCALE,
 };
 use crate::margin::MarginKind;
 use crate::types::{
@@ -137,7 +138,7 @@ impl Engine {
         Ok(())
     }
 
-    fn cancel_resting(
+    pub(super) fn cancel_resting(
         &mut self,
         market: MarketId,
         id: OrderId,
@@ -168,6 +169,7 @@ impl Engine {
         remove: u64,
         now: Millis,
         ref_price: Price,
+        adverse: i128,
     ) -> Result<()> {
         let m = self.markets.get(&market).ok_or(Error::UnknownMarket)?;
         let pos = i128::from(acct.size_in(market));
@@ -192,6 +194,9 @@ impl Engine {
         if after > m.cfg.max_position {
             return Err(Error::PositionLimit);
         }
+        if adverse > 0 {
+            self.check_equity_floor(acct, now, adverse, true)?;
+        }
         if after <= before {
             return Ok(());
         }
@@ -208,10 +213,79 @@ impl Engine {
         let taker_ppm = self.fee_tier_of_account(acct)?.taker_ppm;
         let ref_n = notional(ref_price.max(mark), Qty(add), Round::Ceil)?;
         let reserve = ppm_of(ref_n, taker_ppm, Round::Ceil)?;
-        if equity.checked_sub(reserve.0).ok_or(Error::Overflow)? < required {
+        // The order may execute away from the mark: its execution-price loss
+        // (`adverse`, see `price_impact`) is reserved next to the fee.
+        let reserved = reserve.0.checked_add(adverse).ok_or(Error::Overflow)?;
+        if equity.checked_sub(reserved).ok_or(Error::Overflow)? < required {
             return Err(Error::MarginBreach);
         }
         Ok(())
+    }
+
+    /// Reject an order whose worst-case execution-price loss (`adverse`) would
+    /// leave the account with negative equity: a fill must never create a
+    /// deficit that the insurance fund would have to absorb.
+    pub(super) fn check_equity_floor(
+        &self,
+        acct: &Account,
+        now: Millis,
+        adverse: i128,
+        fresh: bool,
+    ) -> Result<()> {
+        let equity = self.equity_of(acct, now, fresh)?;
+        if equity.checked_sub(adverse).ok_or(Error::Overflow)? < 0 {
+            return Err(Error::MarginBreach);
+        }
+        Ok(())
+    }
+
+    /// Dry run of the matching loop for a taker: the net equity the taker would
+    /// lose by trading at the resting prices instead of at the mark (a positive
+    /// number is a loss, rounded against the taker; gains offset losses), and
+    /// the quantity that would fill. Reduce-only makers are assumed to fill in
+    /// full, which can only overstate the loss.
+    #[allow(clippy::too_many_arguments)]
+    fn price_impact(
+        &self,
+        market: MarketId,
+        account: AccountId,
+        side: Side,
+        limit: Price,
+        qty: u64,
+        stp: StpMode,
+        mark: Price,
+    ) -> Result<(i128, u64)> {
+        let m = self.markets.get(&market).ok_or(Error::UnknownMarket)?;
+        let mut need = qty;
+        let mut fills = 0usize;
+        let mut loss = 0i128;
+        'levels: for (price, level) in m.book.levels(side.opposite()) {
+            if !crosses(side, price, limit) {
+                break;
+            }
+            for id in level.queue.values() {
+                let o = m
+                    .book
+                    .get(*id)
+                    .ok_or(Error::Internal("level refers to missing order"))?;
+                if o.account == account {
+                    if stp == StpMode::CancelOldest {
+                        continue;
+                    }
+                    break 'levels;
+                }
+                let take = o.qty.min(need);
+                loss = loss
+                    .checked_add(price_loss(side, price, mark, take)?)
+                    .ok_or(Error::Overflow)?;
+                need -= take;
+                fills += 1;
+                if need == 0 || fills >= MAX_FILLS_PER_MATCH {
+                    break 'levels;
+                }
+            }
+        }
+        Ok((loss, qty - need))
     }
 
     fn fee_tier_of_account(&self, acct: &Account) -> Result<FeeTier> {
@@ -219,6 +293,28 @@ impl Engine {
             .as_ref()
             .and_then(|c| c.fee_tiers.get(usize::from(acct.fee_tier)).copied())
             .ok_or(Error::Internal("fee tier missing"))
+    }
+
+    /// Cancel resting orders that the new mark has made more aggressive than the
+    /// price band allows (bids above `mark * (1 + band)`, asks below
+    /// `mark * (1 - band)`), so that no fill executes outside the band.
+    pub(super) fn sweep_price_band(
+        &mut self,
+        market: MarketId,
+        out: &mut Vec<Output>,
+    ) -> Result<()> {
+        let m = self.markets.get(&market).ok_or(Error::UnknownMarket)?;
+        let Some(mark) = m.mark else {
+            return Ok(());
+        };
+        let hi = band_price(mark, m.cfg.price_band_bps, Side::Buy)?;
+        let lo = band_price(mark, m.cfg.price_band_bps, Side::Sell)?;
+        let mut ids = m.book.aggressive_ids(Side::Buy, hi);
+        ids.extend(m.book.aggressive_ids(Side::Sell, lo));
+        for id in ids {
+            self.cancel_resting(market, id, CancelReason::PriceBand, out)?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -241,10 +337,14 @@ impl Engine {
             return Err(Error::InvalidQty);
         }
         let opp = p.side.opposite();
-        let (limit, ref_price, rests, post_only, fok) = match p.kind {
+        let (limit, ref_price, rests, post_only, fok, mark) = match p.kind {
             OrderKind::Limit { price, tif } => {
                 if price.0 == 0 || price.0 > MAX_PRICE || !price.0.is_multiple_of(cfg.tick) {
                     return Err(Error::InvalidPrice);
+                }
+                let mark = m.mark.ok_or(Error::NoMarkPrice)?;
+                if beyond_band(p.side, price, mark, cfg.price_band_bps)? {
+                    return Err(Error::PriceOutsideBand);
                 }
                 (
                     price,
@@ -252,47 +352,29 @@ impl Engine {
                     matches!(tif, Tif::Gtc | Tif::PostOnly),
                     tif == Tif::PostOnly,
                     tif == Tif::Fok,
+                    mark,
                 )
             }
             OrderKind::Market { max_slippage_bps } => {
                 if max_slippage_bps > 5_000 {
                     return Err(Error::InvalidSlippage);
                 }
-                let best = m.book.best(opp).ok_or(Error::NoLiquidity)?;
-                let limit = match p.side {
-                    Side::Buy => {
-                        let up = u32::try_from(BPS_SCALE)
-                            .map_err(|_| Error::Overflow)?
-                            .saturating_add(max_slippage_bps);
-                        let v = mul_div(
-                            i128::from(best.0),
-                            i128::from(up),
-                            i128::from(BPS_SCALE),
-                            Round::Floor,
-                        )?;
-                        Price(
-                            u64::try_from(v)
-                                .map_err(|_| Error::Overflow)?
-                                .min(MAX_PRICE),
-                        )
-                    }
-                    Side::Sell => {
-                        let down = u32::try_from(BPS_SCALE)
-                            .map_err(|_| Error::Overflow)?
-                            .saturating_sub(max_slippage_bps);
-                        let v = mul_div(
-                            i128::from(best.0),
-                            i128::from(down),
-                            i128::from(BPS_SCALE),
-                            Round::Ceil,
-                        )?;
-                        Price(u64::try_from(v).map_err(|_| Error::Overflow)?.max(1))
-                    }
-                };
-                (limit, best, false, false, false)
+                m.book.best(opp).ok_or(Error::NoLiquidity)?;
+                let mark = m.mark.ok_or(Error::NoMarkPrice)?;
+                // The protection price is measured from the MARK, never from the
+                // best opposite price (a far-away best quote would otherwise be
+                // acceptable), and never wider than the market's price band.
+                let slip = max_slippage_bps.min(cfg.price_band_bps);
+                (
+                    band_price(mark, slip, p.side)?,
+                    mark,
+                    false,
+                    false,
+                    false,
+                    mark,
+                )
             }
         };
-        m.mark.ok_or(Error::NoMarkPrice)?;
         let stale = ts.saturating_sub(m.oracle_ts) > cfg.oracle_max_staleness_ms;
         if stale && !p.reduce_only {
             return Err(Error::StaleOracle);
@@ -315,11 +397,20 @@ impl Engine {
                 return Err(Error::ReduceOnlyViolation);
             }
             qty = qty.min(allowed);
+        } else if notional_raw(ref_price.0, qty, Round::Floor)? < cfg.min_notional {
+            return Err(Error::BelowMinNotional);
+        }
+        let (impact, est_fill) =
+            self.price_impact(p.market, p.account, p.side, limit, qty, p.stp, mark)?;
+        let rest_qty = if rests { qty - est_fill } else { 0 };
+        let adverse = impact
+            .max(0)
+            .checked_add(price_loss(p.side, limit, mark, rest_qty)?.max(0))
+            .ok_or(Error::Overflow)?;
+        if p.reduce_only {
+            self.check_equity_floor(acct, ts, adverse, !stale)?;
         } else {
-            if notional_raw(ref_price.0, qty, Round::Floor)? < cfg.min_notional {
-                return Err(Error::BelowMinNotional);
-            }
-            self.check_new_exposure(acct, p.market, p.side, qty, 0, ts, ref_price)?;
+            self.check_new_exposure(acct, p.market, p.side, qty, 0, ts, ref_price, adverse)?;
         }
         if post_only
             && m.book
@@ -711,6 +802,10 @@ impl Engine {
         {
             return Err(Error::WouldCross);
         }
+        let mark = m.mark.ok_or(Error::NoMarkPrice)?;
+        if new_price != old.price && beyond_band(old.side, new_price, mark, cfg.price_band_bps)? {
+            return Err(Error::PriceOutsideBand);
+        }
         let keep = new_price == old.price && new_qty <= old.qty;
         if old.reduce_only {
             if new_qty > self.reducible(account, market, old.side) {
@@ -724,7 +819,10 @@ impl Engine {
                 if ts.saturating_sub(m.oracle_ts) > cfg.oracle_max_staleness_ms {
                     return Err(Error::StaleOracle);
                 }
-                self.check_new_exposure(acct, market, old.side, new_qty, old.qty, ts, new_price)?;
+                let adverse = price_loss(old.side, new_price, mark, new_qty)?.max(0);
+                self.check_new_exposure(
+                    acct, market, old.side, new_qty, old.qty, ts, new_price, adverse,
+                )?;
             }
         }
         if !keep
@@ -767,6 +865,28 @@ pub(super) fn crosses(taker_side: Side, best: Price, limit: Price) -> bool {
         Side::Buy => best <= limit,
         Side::Sell => best >= limit,
     }
+}
+
+/// Equity lost by trading `qty` at `price` instead of at `mark`, as a taker on
+/// `side`: positive for a buy above the mark or a sell below it. Rounded up, so
+/// a loss is never understated and a gain never overstated.
+pub(super) fn price_loss(side: Side, price: Price, mark: Price, qty: u64) -> Result<i128> {
+    let diff = match side {
+        Side::Buy => i128::from(price.0) - i128::from(mark.0),
+        Side::Sell => i128::from(mark.0) - i128::from(price.0),
+    };
+    let n = diff.checked_mul(i128::from(qty)).ok_or(Error::Overflow)?;
+    ceil_div(n, i128::from(QTY_SCALE))
+}
+
+/// Is `price` more aggressive than the band around `mark` allows for an order
+/// on `side` (a buy above `mark * (1 + band)` or a sell below `mark * (1 - band)`)?
+pub(super) fn beyond_band(side: Side, price: Price, mark: Price, band_bps: u32) -> Result<bool> {
+    let edge = band_price(mark, band_bps, side)?;
+    Ok(match side {
+        Side::Buy => price > edge,
+        Side::Sell => price < edge,
+    })
 }
 
 /// Price `band_bps` away from `mark`, rounded so that the band is never wider

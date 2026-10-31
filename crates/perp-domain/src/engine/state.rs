@@ -106,6 +106,7 @@ impl Engine {
         for id in &self.pending_liq {
             w.u64(*id);
         }
+        w.u64(self.liq_cursor);
         w.count(self.markets.len());
         for (id, m) in &self.markets {
             debug_assert_eq!(*id, m.cfg.id);
@@ -180,6 +181,7 @@ impl Engine {
             last = Some(id);
             e.pending_liq.insert(id);
         }
+        e.liq_cursor = r.u64()?;
 
         let n = r.count(max_markets, MIN_MARKET_BYTES)?;
         let mut last_market: Option<MarketId> = None;

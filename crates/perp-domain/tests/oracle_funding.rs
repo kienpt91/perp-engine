@@ -420,22 +420,40 @@ fn mid_and_last_trade_on_opposite_sides_of_the_index_leave_the_mark_at_the_index
 
 #[test]
 fn mark_is_clamped_to_the_deviation_band_above_the_index() {
-    let mut ex = with_last_trade_and_remaining_ask(53_000);
-    ex.gtc(3, Side::Buy, 52_900, 1_000); // mid 52 950, last trade 53 000
-    let (index, mark, _) = mark_updated(&ex.oracle(50_000).unwrap());
-    // median is 52 950 but at most index * 1.03 = 51 500
-    assert_eq!((index, mark), (px(50_000), px(51_500)));
+    let mut ex = Ex::new();
+    ex.fund(&[1, 2, 3], 100_000);
+    // last trade at the top of the 2.5% price band around the 50 000 mark
+    let ask = ex.gtc(2, Side::Sell, 51_250, 2_000);
+    let outs = ex.limit(1, Side::Buy, 51_250, 1_000, Tif::Ioc).unwrap();
+    assert_eq!(filled_qty(&outs), 10_000);
+    ex.cancel(2, ask).unwrap();
+    // far passive ask, in-band bid: mid = (50 900 + 60 000) / 2 = 55 450
+    ex.gtc(2, Side::Sell, 60_000, 1_000);
+    ex.gtc(3, Side::Buy, 50_900, 1_000);
+    // index drops 0.6%: the 51 250 trade is now more than 3% above it
+    let (index, mark, clamped) = mark_updated(&ex.oracle(49_700).unwrap());
+    // median(49 700, 55 450, 51 250) = 51 250, capped at 49 700 * 1.03 = 51 191
+    assert_eq!((index, mark, clamped), (px(49_700), px(51_191), false));
+    ex.check();
 }
 
 #[test]
 fn mark_is_clamped_to_the_deviation_band_below_the_index() {
     let mut ex = Ex::new();
     ex.fund(&[1, 2, 3], 100_000);
-    ex.gtc(2, Side::Buy, 47_000, 2_000);
-    ex.limit(1, Side::Sell, 47_000, 1_000, Tif::Ioc).unwrap(); // last 47 000
-    ex.gtc(3, Side::Sell, 47_100, 1_000); // bid 47 000 / ask 47 100 -> mid 47 050
-    let (_, mark, _) = mark_updated(&ex.oracle(50_000).unwrap());
-    assert_eq!(mark, px(48_500)); // index * 0.97
+    // last trade at the bottom of the 2.5% price band around the 50 000 mark
+    let bid = ex.gtc(2, Side::Buy, 48_750, 2_000);
+    let outs = ex.limit(1, Side::Sell, 48_750, 1_000, Tif::Ioc).unwrap();
+    assert_eq!(filled_qty(&outs), 10_000);
+    ex.cancel(2, bid).unwrap();
+    // far passive bid, in-band ask: mid = (40 000 + 49 100) / 2 = 44 550
+    ex.gtc(2, Side::Buy, 40_000, 1_000);
+    ex.gtc(3, Side::Sell, 49_100, 1_000);
+    // index rises 0.6%: the 48 750 trade is now more than 3% below it
+    let (index, mark, clamped) = mark_updated(&ex.oracle(50_300).unwrap());
+    // median(50 300, 44 550, 48 750) = 48 750, floored at 50 300 * 0.97 = 48 791
+    assert_eq!((index, mark, clamped), (px(50_300), px(48_791), false));
+    ex.check();
 }
 
 // ---------------------------------------------------------------------------

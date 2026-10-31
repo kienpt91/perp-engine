@@ -9,8 +9,10 @@
 )]
 
 use perp_domain::engine::Engine;
+use perp_domain::fixed::Price;
+use perp_domain::rng::Rng;
 use perp_domain::traffic::{TrafficConfig, TrafficGenerator};
-use perp_domain::types::{Event, Output, Side};
+use perp_domain::types::{Event, EventBody, Output, Side};
 use std::collections::BTreeSet;
 
 struct Run {
@@ -35,8 +37,44 @@ fn run_checked(seed: u64, accounts: u32, markets: u32, events: usize, check_ever
         engine.apply(&ev).unwrap();
         log.push(ev);
     }
+    let mut shock_rng = Rng::new(seed ^ 0x5EED_0000);
+    let mut pending: Vec<Event> = Vec::new();
     for i in 0..events {
-        let ev = gen.next_event(&engine);
+        // The generator rarely moves the price enough to liquidate anybody, so
+        // every ~400 events a V-shaped shock of up to four 5 % oracle moves
+        // down (or up) and back is injected into the same event stream.
+        if pending.is_empty() && shock_rng.chance(1, 400) {
+            let market = u32::try_from(shock_rng.range(1, u64::from(markets))).unwrap();
+            let down = shock_rng.chance(1, 2);
+            let steps = shock_rng.range(2, 4) as usize;
+            let mut ts = engine.clock();
+            let start = engine.index_price(market).unwrap().0;
+            let mut px = start;
+            let mut path = Vec::new();
+            for _ in 0..steps {
+                px = if down { px / 100 * 95 } else { px / 100 * 105 };
+                path.push(px);
+            }
+            // ... and back to where it started
+            let back: Vec<u64> = path.iter().rev().skip(1).copied().chain([start]).collect();
+            path.extend(back);
+            for p in path {
+                ts += 1;
+                pending.push(Event {
+                    ts,
+                    body: EventBody::Oracle {
+                        market,
+                        index_price: Price(p),
+                        source_ts: ts,
+                    },
+                });
+            }
+            pending.reverse();
+        }
+        let ev = match pending.pop() {
+            Some(ev) => ev,
+            None => gen.next_event(&engine),
+        };
         match engine.apply(&ev) {
             Ok(outs) => {
                 for o in outs {
@@ -113,7 +151,10 @@ fn invariants_hold_over_300k_events_across_seeds() {
         fills > 10_000,
         "flow must actually trade, got {fills} fills"
     );
-    assert!(liq > 0, "flow must exercise liquidation");
+    assert!(
+        liq >= 100,
+        "injected shocks must trigger liquidation, got {liq} steps"
+    );
 }
 
 #[test]

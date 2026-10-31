@@ -141,6 +141,12 @@ impl TrafficGenerator {
         self.client_seq
     }
 
+    /// Reference price for new orders: the mark, because the market's price
+    /// band is measured from it.
+    fn mark_of(&self, engine: &Engine, market: MarketId) -> u64 {
+        engine.mark_price(market).map_or(START_PRICE, |p| p.0)
+    }
+
     fn index_of(&self, engine: &Engine, market: MarketId) -> u64 {
         engine.index_price(market).map_or(START_PRICE, |p| p.0)
     }
@@ -200,7 +206,7 @@ impl TrafficGenerator {
         let market = self.pick_market();
         let account = self.rng.range(1, u64::from(self.cfg.accounts.max(1)));
         let client_id = self.fresh_client_id();
-        let idx = self.index_of(engine, market);
+        let idx = self.mark_of(engine, market);
         match self.rng.below(4) {
             0 => EventBody::Place(PlaceOrder {
                 market,
@@ -285,7 +291,7 @@ impl TrafficGenerator {
 
     fn maker(&mut self, engine: &Engine, account: AccountId, market: MarketId) -> EventBody {
         let open = engine.open_orders_of(account);
-        let idx = self.index_of(engine, market);
+        let idx = self.mark_of(engine, market);
         let tick = engine.market_config(market).map_or(10_000, |c| c.tick);
         if !open.is_empty() && self.rng.chance(1, 3) {
             let id = open
@@ -352,7 +358,7 @@ impl TrafficGenerator {
     fn noise(&mut self, engine: &Engine, account: AccountId, market: MarketId) -> EventBody {
         let side = self.random_side();
         let lots = self.rng.range(1, 40);
-        let idx = self.index_of(engine, market);
+        let idx = self.mark_of(engine, market);
         let tick = engine.market_config(market).map_or(10_000, |c| c.tick);
         if self.rng.chance(1, 2) {
             self.place(
@@ -393,7 +399,7 @@ impl TrafficGenerator {
     }
 
     fn trend(&mut self, engine: &Engine, account: AccountId, market: MarketId) -> EventBody {
-        let idx = self.index_of(engine, market);
+        let idx = self.mark_of(engine, market);
         let older = self
             .history
             .iter()
@@ -428,7 +434,7 @@ impl TrafficGenerator {
             return self.noise(engine, account, market);
         }
         let side = self.random_side();
-        let idx = self.index_of(engine, market);
+        let idx = self.mark_of(engine, market);
         // size so that notional is roughly 15x the account's collateral
         let collateral = engine.collateral(account).map_or(0, |c| c.0.max(0));
         let target = u128::try_from(collateral).unwrap_or(0) * 18;

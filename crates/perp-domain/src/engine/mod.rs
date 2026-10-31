@@ -120,6 +120,8 @@ pub struct Engine {
     net_deposits: i128,
     bad_debt: i128,
     pending_liq: BTreeSet<AccountId>,
+    /// Round-robin position of the liquidation queue (see `run_liquidations`).
+    liq_cursor: AccountId,
     halted: Option<Halt>,
     fills: u64,
     liq_steps: u64,
@@ -150,6 +152,7 @@ impl Engine {
             net_deposits: 0,
             bad_debt: 0,
             pending_liq: BTreeSet::new(),
+            liq_cursor: 0,
             halted: None,
             fills: 0,
             liq_steps: 0,
@@ -180,6 +183,109 @@ impl Engine {
                     });
                 }
                 Err(e)
+            }
+        }
+    }
+
+    /// Cheap, side-effect-free check of the rejections that need nothing but a
+    /// look-up: an event that fails here would be rejected by [`Engine::apply`]
+    /// with the same error and without changing anything, so a caller that logs
+    /// events before applying them may refuse it *before* logging. It never
+    /// replaces `apply`: events that pass can still be rejected there (margin,
+    /// liquidity, price bands, limits, ...).
+    pub fn precheck(&self, event: &Event) -> Result<()> {
+        if self.halted.is_some() {
+            return Err(Error::Halted);
+        }
+        if event.ts < self.clock {
+            return Err(Error::TimeRegression);
+        }
+        if let EventBody::Configure(_) = &event.body {
+            return if self.config.is_some() {
+                Err(Error::AlreadyConfigured)
+            } else {
+                Ok(())
+            };
+        }
+        let Some(config) = &self.config else {
+            return Err(Error::NotConfigured);
+        };
+        let account = |id: &AccountId| self.accounts.get(id).ok_or(Error::UnknownAccount);
+        match &event.body {
+            EventBody::Configure(_) | EventBody::Tick => Ok(()),
+            EventBody::AddMarket(m) => {
+                m.validate()?;
+                if self.markets.contains_key(&m.id) {
+                    Err(Error::MarketExists)
+                } else if self.markets.len() >= MAX_MARKETS {
+                    Err(Error::TooManyMarkets)
+                } else {
+                    Ok(())
+                }
+            }
+            EventBody::SetFeeTier { account: a, tier } => {
+                if usize::from(*tier) >= config.fee_tiers.len() {
+                    return Err(Error::UnknownFeeTier);
+                }
+                account(a).map(|_| ())
+            }
+            EventBody::Deposit { amount, .. } | EventBody::FundInsurance { amount } => {
+                if amount.0 <= 0 {
+                    Err(Error::ZeroAmount)
+                } else if amount.0 > MAX_AMOUNT {
+                    Err(Error::AmountTooLarge)
+                } else {
+                    Ok(())
+                }
+            }
+            EventBody::Withdraw { account: a, amount } => {
+                if amount.0 <= 0 {
+                    return Err(Error::ZeroAmount);
+                }
+                if amount.0 > account(a)?.collateral {
+                    return Err(Error::InsufficientCollateral);
+                }
+                Ok(())
+            }
+            EventBody::Place(p) => {
+                let m = self.markets.get(&p.market).ok_or(Error::UnknownMarket)?;
+                account(&p.account)?;
+                if p.qty.0 == 0 {
+                    return Err(Error::ZeroQty);
+                }
+                if p.qty.0 > m.cfg.max_order_qty || !p.qty.0.is_multiple_of(m.cfg.lot) {
+                    return Err(Error::InvalidQty);
+                }
+                Ok(())
+            }
+            EventBody::Cancel {
+                account: a,
+                order_id,
+            } => {
+                if account(a)?.orders.contains_key(order_id) {
+                    Ok(())
+                } else {
+                    Err(Error::UnknownOrder)
+                }
+            }
+            EventBody::CancelAll { account: a, .. } => account(a).map(|_| ()),
+            EventBody::Replace {
+                account: a,
+                order_id,
+                ..
+            } => {
+                if account(a)?.orders.contains_key(order_id) {
+                    Ok(())
+                } else {
+                    Err(Error::UnknownOrder)
+                }
+            }
+            EventBody::Oracle { market, .. } => {
+                if self.markets.contains_key(market) {
+                    Ok(())
+                } else {
+                    Err(Error::UnknownMarket)
+                }
             }
         }
     }

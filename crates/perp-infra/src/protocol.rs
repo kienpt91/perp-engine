@@ -492,6 +492,7 @@ fn reason_name(r: CancelReason) -> &'static str {
         CancelReason::ReduceOnly => "reduce_only",
         CancelReason::BookFull => "book_full",
         CancelReason::Liquidation => "liquidation",
+        CancelReason::PriceBand => "price_band",
     }
 }
 

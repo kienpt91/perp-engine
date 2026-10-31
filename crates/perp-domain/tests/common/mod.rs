@@ -253,3 +253,16 @@ pub fn filled_qty(outs: &[Output]) -> u64 {
 pub fn has(outs: &[Output], f: impl Fn(&Output) -> bool) -> bool {
     outs.iter().any(f)
 }
+
+impl Ex {
+    /// Like [`Ex::bare`] but with a caller-chosen engine configuration.
+    pub fn bare_with(cfg: EngineConfig) -> Ex {
+        let mut ex = Ex {
+            engine: Engine::new(),
+            ts: 1_000,
+            client: 0,
+        };
+        ex.apply(EventBody::Configure(cfg)).unwrap();
+        ex
+    }
+}

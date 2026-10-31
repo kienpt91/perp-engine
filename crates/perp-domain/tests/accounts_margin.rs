@@ -956,6 +956,7 @@ fn long_position_lifecycle_open_extend_partial_close_full_close() {
     );
 
     // close 1.0 @ 52 000: released basis = ceil(151 000 / 3), fee 26
+    ex.oracle(52_000).unwrap(); // keep the quotes inside the 2.5% price band
     ex.trade(1, 2, Side::Sell, 52_000, 1_000);
     let p = ex.engine.position(1, M).unwrap();
     assert_eq!(p.size, 20_000);
@@ -968,6 +969,7 @@ fn long_position_lifecycle_open_extend_partial_close_full_close() {
     assert_eq!(ex.collateral(1), 101_565_166_666);
 
     // close the rest 2.0 @ 53 000: realised 106 000 - 100 666.666666, fee 53
+    ex.oracle(53_000).unwrap();
     ex.trade(1, 2, Side::Sell, 53_000, 2_000);
     assert!(ex.engine.position(1, M).is_none(), "flat after full close");
     assert_eq!(ex.collateral(1), 106_845_500_000);

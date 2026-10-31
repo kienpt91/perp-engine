@@ -132,6 +132,7 @@ impl Engine {
             mark,
             clamped,
         });
+        self.sweep_price_band(market, out)?;
         Ok(())
     }
 

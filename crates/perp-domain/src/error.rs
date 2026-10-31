@@ -51,6 +51,8 @@ pub enum Error {
     BelowMinNotional,
     /// Slippage parameter out of range.
     InvalidSlippage,
+    /// Limit price is further from the mark than the market's price band allows.
+    PriceOutsideBand,
     /// Post-only order would have matched.
     WouldCross,
     /// Fill-or-kill order cannot be filled completely.
@@ -108,6 +110,7 @@ impl Error {
             Error::InvalidPrice => "invalid_price",
             Error::BelowMinNotional => "below_min_notional",
             Error::InvalidSlippage => "invalid_slippage",
+            Error::PriceOutsideBand => "price_outside_band",
             Error::WouldCross => "would_cross",
             Error::FokNotFillable => "fok_not_fillable",
             Error::NoLiquidity => "no_liquidity",
@@ -171,6 +174,7 @@ mod tests {
             Error::InvalidPrice,
             Error::BelowMinNotional,
             Error::InvalidSlippage,
+            Error::PriceOutsideBand,
             Error::WouldCross,
             Error::FokNotFillable,
             Error::NoLiquidity,

@@ -648,19 +648,21 @@ fn market_order_filled_completely_emits_no_cancel() {
 }
 
 #[test]
-fn market_order_is_checked_for_minimum_notional_at_the_best_price() {
-    let mut ex = ex4();
-    // 3 milli at 5_000 = 15 quote: acceptable as a resting ask
-    ask(&mut ex, 2, 5_000, 3);
-    // 1 milli at the best price 5_000 = 5 quote < 10
+fn market_order_minimum_notional_is_measured_at_the_mark_not_the_best_price() {
+    let mut cfg = MarketConfig::example(M);
+    cfg.min_notional = usd(101);
+    let mut ex = ex4_with(cfg);
+    // best ask 51_000 is inside the band (mark 50_000 +2.5% = 51_250)
+    ask(&mut ex, 2, 51_000, 3);
+    // 2 milli: 102 quote at the best ask but only 100 at the mark (< 101)
     assert_eq!(
-        ex.market(1, Side::Buy, 1, 100),
+        ex.market(1, Side::Buy, 2, 250),
         Err(Error::BelowMinNotional)
     );
-    assert_eq!(
-        filled_qty(&ex.market(1, Side::Buy, 2, 100).unwrap()),
-        qty(2).0
-    );
+    // 3 milli: 150 quote at the mark
+    let outs = ex.market(1, Side::Buy, 3, 250).unwrap();
+    assert_eq!(filled_qty(&outs), qty(3).0);
+    ex.check();
 }
 
 // ---------------------------------------------------------------------------
@@ -776,19 +778,21 @@ fn resting_reduce_only_order_is_cancelled_when_the_position_vanished() {
 
 #[test]
 fn reduce_only_is_exempt_from_minimum_notional_but_regular_orders_are_not() {
-    let mut ex = ex4();
-    ex.trade(1, 2, Side::Buy, 50_000, 1); // 1 milli long
+    let mut cfg = MarketConfig::example(M);
+    cfg.min_notional = usd(100);
+    let mut ex = ex4_with(cfg);
+    ex.trade(1, 2, Side::Buy, 50_000, 2); // 2 milli long = 100 quote
     bid(&mut ex, 3, 50_000, 5);
-    // limit price 100: notional 0.1 quote < 10
+    // 1 milli at 50_000 = 50 quote < 100
     assert_eq!(
-        ex.limit(1, Side::Sell, 100, 1, Tif::Ioc),
+        ex.limit(1, Side::Sell, 50_000, 1, Tif::Ioc),
         Err(Error::BelowMinNotional)
     );
-    let p = ro_order(&mut ex, 1, Side::Sell, 100, 1, Tif::Ioc);
+    let p = ro_order(&mut ex, 1, Side::Sell, 50_000, 1, Tif::Ioc);
     let outs = ex.place(p).unwrap();
     assert_eq!(fill_list(&outs).len(), 1);
     assert_eq!(filled_qty(&outs), qty(1).0);
-    assert_eq!(ex.size(1), 0);
+    assert_eq!(ex.size(1), qty(1).0 as i64);
     ex.check();
 }
 

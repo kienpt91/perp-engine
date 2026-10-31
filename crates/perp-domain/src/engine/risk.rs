@@ -43,6 +43,17 @@ use crate::types::{AccountId, CancelReason, MarketId, Millis, OrderId, Output, S
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
+/// Equity and maintenance requirement of the fresh part of an account (see
+/// [`Engine::assess`]).
+pub(super) struct Assessment {
+    pub equity: i128,
+    pub required: i128,
+    /// Lowest market id with a fresh mark.
+    pub first: MarketId,
+    /// True if some position sits in a market without a fresh mark.
+    pub stale: bool,
+}
+
 impl Engine {
     /// Operator kill switch: stop the engine. Later events return
     /// [`Error::Halted`]; the flag is part of the state hash and snapshots.
@@ -116,25 +127,70 @@ impl Engine {
         Ok(total)
     }
 
-    /// Is the account below maintenance margin (and evaluable: fresh prices)?
+    /// Equity and maintenance requirement of the part of the account whose
+    /// markets have a fresh mark. A market with a stale or missing oracle is
+    /// left out of both sides (its positions neither add PnL nor margin), so one
+    /// dead oracle cannot shield losses on a live market, and a dead oracle never
+    /// makes an otherwise healthy account look bankrupt. `None` when no position
+    /// has a fresh mark.
+    pub(super) fn assess(&self, acct: &Account, now: Millis) -> Result<Option<Assessment>> {
+        let mut equity = acct.collateral;
+        let mut required = 0i128;
+        let mut first = None;
+        let mut stale = false;
+        for (market, pos) in &acct.positions {
+            let mark = match self.mark_for(*market, now, true) {
+                Ok(m) => m,
+                Err(Error::StaleOracle | Error::NoMarkPrice) => {
+                    stale = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let value = signed_value(pos.size, mark)?;
+            let upnl = value.0.checked_sub(pos.basis).ok_or(Error::Overflow)?;
+            equity = equity.checked_add(upnl).ok_or(Error::Overflow)?;
+            let m = self.markets.get(market).ok_or(Error::UnknownMarket)?;
+            let n = notional(mark, Qty(pos.size.unsigned_abs()), Round::Ceil)?;
+            required = required
+                .checked_add(required_margin(&m.cfg, n, MarginKind::Maintenance)?.0)
+                .ok_or(Error::Overflow)?;
+            first.get_or_insert(*market);
+        }
+        Ok(first.map(|first| Assessment {
+            equity,
+            required,
+            first,
+            stale,
+        }))
+    }
+
+    /// Is the account below maintenance margin (judged on its fresh markets)?
     pub(super) fn is_liquidatable(&self, id: AccountId, now: Millis) -> Result<bool> {
         let Some(acct) = self.accounts.get(&id) else {
             return Ok(false);
         };
-        if acct.positions.is_empty() {
-            return Ok(false);
-        }
-        let equity = match self.equity_of(acct, now, true) {
-            Ok(e) => e,
-            Err(Error::StaleOracle | Error::NoMarkPrice) => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        let required =
-            self.margin_requirement(acct, MarginKind::Maintenance, false, now, true, None)?;
-        Ok(equity < required)
+        Ok(self
+            .assess(acct, now)?
+            .is_some_and(|a| a.equity < a.required))
+    }
+
+    /// Next queued account in round-robin order: the first id at or after the
+    /// cursor, wrapping to the lowest id.
+    fn next_pending(&self) -> Option<AccountId> {
+        self.pending_liq
+            .range(self.liq_cursor..)
+            .next()
+            .or_else(|| self.pending_liq.first())
+            .copied()
     }
 
     /// Process queued maintenance checks within the per-event budget.
+    ///
+    /// The queue is served round-robin from a persistent cursor, not lowest id
+    /// first: accounts that cannot be filled (nobody quotes the other side) use
+    /// up budget but cannot starve the accounts behind them, which are reached
+    /// within `ceil(pending / budget)` events.
     pub(super) fn run_liquidations(&mut self, out: &mut Vec<Output>) -> Result<()> {
         let budget = self
             .config
@@ -142,7 +198,9 @@ impl Engine {
             .map_or(0, |c| c.max_liquidations_per_event);
         let now = self.clock;
         let mut steps = 0u32;
-        while let Some(id) = self.pending_liq.pop_first() {
+        while let Some(id) = self.next_pending() {
+            self.pending_liq.remove(&id);
+            self.liq_cursor = id.saturating_add(1);
             let flat = self
                 .accounts
                 .get(&id)
@@ -156,6 +214,7 @@ impl Engine {
             }
             if steps >= budget {
                 self.pending_liq.insert(id);
+                self.liq_cursor = id;
                 break;
             }
             steps += 1;
@@ -210,14 +269,29 @@ impl Engine {
             .accounts
             .get(&id)
             .ok_or(Error::Internal("liquidating unknown account"))?;
-        let (market, pos) = acct
+        let view = self.assess(acct, now)?.ok_or(Error::Internal(
+            "liquidating an account without a fresh mark",
+        ))?;
+        let market = view.first;
+        let pos = acct
             .positions
-            .iter()
-            .next()
-            .map(|(m, p)| (*m, *p))
+            .get(&market)
+            .copied()
             .ok_or(Error::Internal("liquidating a flat account"))?;
-        let equity = self.equity_of(acct, now, true)?;
+        let equity = view.equity;
         let mark = self.mark_for(market, now, true)?;
+        // What closing THIS position at the mark would leave the account owing:
+        // the part of the deficit that is (about to be) realised.
+        let upnl_here = signed_value(pos.size, mark)?
+            .0
+            .checked_sub(pos.basis)
+            .ok_or(Error::Overflow)?;
+        let deficit_here = acct
+            .collateral
+            .checked_add(upnl_here)
+            .and_then(i128::checked_neg)
+            .ok_or(Error::Overflow)?
+            .max(0);
         let (chunk_bps, band_bps, liq_fee_ppm, lot) = {
             let c = &self.markets.get(&market).ok_or(Error::UnknownMarket)?.cfg;
             (c.liq_chunk_bps, c.liq_band_bps, c.liq_fee_ppm, c.lot)
@@ -275,7 +349,7 @@ impl Engine {
             };
             (limit, liq_fee_ppm)
         } else {
-            let deficit = -equity;
+            let deficit = deficit_here;
             let slip = bps_of(
                 notional(mark, Qty(chunk), Round::Ceil)?,
                 band_bps,
@@ -302,24 +376,43 @@ impl Engine {
             liq_fee_ppm: fee_ppm,
         };
         let res = self.match_taker(market, &mut taker, out)?;
-        if equity < 0 {
-            let acct = self
-                .accounts
-                .get(&id)
-                .ok_or(Error::Internal("account vanished"))?;
-            let after = self.equity_of(acct, now, false)?;
-            if after < 0 {
-                self.cover_deficit(id, -after, out)?;
-            }
-        }
-        if self
+        self.cover_realised_shortfall(id, now, out)?;
+        Ok(res.filled > 0)
+    }
+
+    /// After a liquidation chunk: if the account's collateral is negative, that
+    /// shortfall is a loss that has been *realised* and nobody owns, so the
+    /// insurance fund pays exactly that amount (bad debt if it is empty). Unrealised
+    /// losses of positions that are still open are never credited: the account
+    /// stays insolvent and keeps being liquidated. Nothing is paid while the
+    /// account still holds a position in a market with a stale oracle (its PnL is
+    /// unknown) or while its fresh part is solvent (gains elsewhere back the debit).
+    fn cover_realised_shortfall(
+        &mut self,
+        id: AccountId,
+        now: Millis,
+        out: &mut Vec<Output>,
+    ) -> Result<()> {
+        let acct = self
             .accounts
             .get(&id)
-            .is_some_and(|a| a.positions.is_empty())
-        {
-            self.cover_shortfall(id, out)?;
+            .ok_or(Error::Internal("account vanished"))?;
+        if acct.collateral >= 0 {
+            return Ok(());
         }
-        Ok(res.filled > 0)
+        let owed = -acct.collateral;
+        let settle = if acct.positions.is_empty() {
+            true
+        } else {
+            match self.assess(acct, now)? {
+                Some(a) => !a.stale && a.equity < 0,
+                None => false,
+            }
+        };
+        if settle {
+            self.cover_deficit(id, owed, out)?;
+        }
+        Ok(())
     }
 
     /// Insurance fund pays what it can, then the whole position is closed

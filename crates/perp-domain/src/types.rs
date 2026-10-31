@@ -254,6 +254,13 @@ pub struct MarketConfig {
     pub oracle_max_staleness_ms: u64,
     /// Largest distance of mark from index, in bps.
     pub max_mark_deviation_bps: u32,
+    /// Price band around the mark, in bps. A limit order that would trade more
+    /// than this far *against its owner's interest relative to the mark* (a buy
+    /// above `mark * (1 + band)`, a sell below `mark * (1 - band)`) is rejected,
+    /// market-order slippage is capped to it, and when the mark moves, resting
+    /// orders that have become that aggressive are cancelled. So no fill executes
+    /// outside the band. It must not exceed the first maintenance margin rate.
+    pub price_band_bps: u32,
     /// Funding interval in milliseconds.
     pub funding_interval_ms: u64,
     /// Funding rate clamp per interval, in ppb (1e-9).
@@ -299,6 +306,7 @@ impl MarketConfig {
             oracle_max_change_bps: 500,
             oracle_max_staleness_ms: 60_000,
             max_mark_deviation_bps: 300,
+            price_band_bps: 250,
             funding_interval_ms: 3_600_000,
             funding_cap_ppb: 5_000_000,
             funding_interest_ppb: 100_000,
@@ -378,6 +386,10 @@ impl MarketConfig {
         }
         if self.max_mark_deviation_bps == 0 || self.max_mark_deviation_bps > 5_000 {
             return bad("max_mark_deviation_bps");
+        }
+        let first_mmr = self.tiers.first().map_or(0, |t| t.mmr_bps);
+        if self.price_band_bps == 0 || self.price_band_bps > first_mmr {
+            return bad("price_band_bps must be 1..=first tier mmr_bps");
         }
         if self.funding_interval_ms < 1_000 || self.funding_interval_ms > 86_400_000 {
             return bad("funding_interval_ms");
@@ -496,6 +508,9 @@ pub enum CancelReason {
     BookFull,
     /// Cancelled because the account is being liquidated.
     Liquidation,
+    /// The mark moved and the order became more aggressive than the price band
+    /// allows (see [`MarketConfig::price_band_bps`]).
+    PriceBand,
 }
 
 /// Output events produced by [`crate::engine::Engine::apply`].
@@ -864,6 +879,7 @@ impl Encode for MarketConfig {
         w.u32(self.oracle_max_change_bps);
         w.u64(self.oracle_max_staleness_ms);
         w.u32(self.max_mark_deviation_bps);
+        w.u32(self.price_band_bps);
         w.u64(self.funding_interval_ms);
         w.i64(self.funding_cap_ppb);
         w.i64(self.funding_interest_ppb);
@@ -902,6 +918,7 @@ impl Decode for MarketConfig {
             oracle_max_change_bps: r.u32()?,
             oracle_max_staleness_ms: r.u64()?,
             max_mark_deviation_bps: r.u32()?,
+            price_band_bps: r.u32()?,
             funding_interval_ms: r.u64()?,
             funding_cap_ppb: r.i64()?,
             funding_interest_ppb: r.i64()?,

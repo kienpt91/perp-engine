@@ -291,7 +291,8 @@ fn hostile_pending_count_is_rejected_before_allocating() {
 fn hostile_market_count_is_rejected() {
     let e = empty_engine();
     let mut bytes = enc(&e);
-    let at = base(&e) + OFF_PENDING_COUNT + 4;
+    // pending count (4) + no ids + liquidation cursor (8) precede the market count
+    let at = base(&e) + OFF_PENDING_COUNT + 4 + 8;
     put(&mut bytes, at, &u32::MAX.to_le_bytes());
     assert_eq!(dec(&bytes).err(), Some(DecodeError("count above limit")));
     put(&mut bytes, at, &65u32.to_le_bytes());
@@ -353,6 +354,7 @@ fn unsorted_or_duplicate_pending_liquidations_are_rejected() {
         for id in ids {
             v.extend_from_slice(&id.to_le_bytes());
         }
+        v.extend_from_slice(&0u64.to_le_bytes()); // liquidation cursor
         v.extend_from_slice(&0u32.to_le_bytes()); // markets
         v.extend_from_slice(&0u32.to_le_bytes()); // accounts
         v
