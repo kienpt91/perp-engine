@@ -12,3 +12,4 @@ pub mod fixed;
 pub mod sha256;
 pub mod codec;
 pub mod types;
+pub mod views;
