@@ -21,7 +21,7 @@ stripe-webhook-secret	whsec_[A-Za-z0-9]{16,}
 slack-token	xox[abprs]-[A-Za-z0-9-]{10,}
 google-api-key	AIza[0-9A-Za-z_-]{35}
 npm-token	npm_[A-Za-z0-9]{36}
-openai-style-key	sk-[A-Za-z0-9_-]{32,}
+sk-style-key	sk-[A-Za-z0-9_-]{32,}
 jwt	eyJ[A-Za-z0-9_-]{15,}\.eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{10,}
 url-with-password	[a-z][a-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]@]{6,}@[^/[:space:]]+
 quoted-secret-assignment	(api[_-]?key|secret|token|passwd|password|private[_-]?key)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9+/_=-]{24,}["'"'"']
