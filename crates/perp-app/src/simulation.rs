@@ -231,6 +231,7 @@ mod tests {
         let cfg = ServiceConfig {
             snapshot_every,
             keep_snapshots: 2,
+            ..ServiceConfig::default()
         };
         ExchangeService::open(log, InMemorySnapshotStore::new(), ManualClock::new(0), cfg)
             .unwrap()
@@ -260,12 +261,18 @@ mod tests {
     }
 
     #[test]
-    fn every_generated_event_is_logged_accepted_or_rejected() {
+    fn every_generated_event_is_accepted_or_rejected_and_only_prechecked_ones_skip_the_log() {
         let log = InMemoryEventLog::new();
-        let r = run_simulation(&mut service(log.clone(), 0), &cfg(1, 2_000), &NoProbe).unwrap();
+        let mut svc = service(log.clone(), 0);
+        let r = run_simulation(&mut svc, &cfg(1, 2_000), &NoProbe).unwrap();
         assert_eq!(r.events, 2_000);
         assert_eq!(r.accepted + r.rejected_total(), 2_000);
-        assert_eq!(log.events().len() as u64, r.bootstrap_events + 2_000);
+        // Events the pre-check refuses are neither logged nor applied; the
+        // log holds exactly what the engine counted.
+        let logged = log.events().len() as u64;
+        assert_eq!(logged, svc.engine().events_applied());
+        assert!(logged >= r.bootstrap_events + r.accepted);
+        assert!(logged < r.bootstrap_events + 2_000);
         assert!(
             r.rejected_total() > 0,
             "the generator emits some invalid events"
@@ -276,11 +283,13 @@ mod tests {
     #[test]
     fn the_logged_run_replays_to_the_reported_state_hash() {
         let log = InMemoryEventLog::new();
-        let r = run_simulation(&mut service(log.clone(), 500), &cfg(3, 4_000), &NoProbe).unwrap();
+        let mut svc = service(log.clone(), 500);
+        let r = run_simulation(&mut svc, &cfg(3, 4_000), &NoProbe).unwrap();
         let mut again = log;
         let (engine, report) = replay_log(&mut again).unwrap();
         assert_eq!(engine.state_hash(), r.state_hash);
-        assert_eq!(report.records, r.bootstrap_events + 4_000);
+        assert_eq!(report.records, svc.engine().events_applied());
+        assert!(report.records <= r.bootstrap_events + 4_000);
     }
 
     #[test]
@@ -339,7 +348,7 @@ mod tests {
         let log = InMemoryEventLog::with_capacity_limit(200);
         let err = run_simulation(&mut service(log, 0), &cfg(1, 1_000), &NoProbe).unwrap_err();
         assert!(
-            matches!(err, SimulationError::Service(ServiceError::Storage(_))),
+            matches!(err, SimulationError::Service(ServiceError::ReadOnly(_))),
             "{err:?}"
         );
     }

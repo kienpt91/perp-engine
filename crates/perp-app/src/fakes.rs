@@ -72,6 +72,12 @@ impl InMemoryEventLog {
         log
     }
 
+    /// Change the record limit of an existing log (`None` removes it), as an
+    /// operator would raise the size limit before restarting.
+    pub fn set_capacity_limit(&self, max_records: Option<u64>) {
+        lock(&self.inner).capacity = max_records;
+    }
+
     /// Log pre-filled with `events`.
     pub fn from_events(events: &[Event]) -> InMemoryEventLog {
         let mut log = InMemoryEventLog::new();

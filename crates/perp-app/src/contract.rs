@@ -22,23 +22,28 @@ use perp_domain::fixed::Money;
 use perp_domain::types::{EngineConfig, Event, EventBody};
 
 /// A deterministic event stream of `n` events that any engine accepts or
-/// rejects the same way on every run: one `Configure`, then a repeating pattern
-/// of deposits, ticks and one withdrawal from an unknown account (which the
-/// engine rejects, so the stream contains legitimately rejected events).
-/// Timestamps never decrease.
+/// rejects the same way on every run: one `Configure` that allows only three
+/// accounts, then a repeating pattern of deposits and ticks. Deposits that
+/// would open a fourth account are rejected by the engine for a reason the
+/// engine's pre-check cannot see, so the stream contains legitimately rejected
+/// events that a service still logs. Every event passes the pre-check, and
+/// timestamps never decrease.
 pub fn scenario_events(n: u64) -> Vec<Event> {
     (0..n)
         .map(|i| {
             let body = if i == 0 {
-                EventBody::Configure(EngineConfig::default())
+                EventBody::Configure(EngineConfig {
+                    max_accounts: 3,
+                    ..EngineConfig::default()
+                })
             } else {
                 match (i - 1) % 5 {
                     0 | 2 => EventBody::Deposit {
                         account: 1 + i % 5,
                         amount: Money(1_000_000 + i128::from(i)),
                     },
-                    3 => EventBody::Withdraw {
-                        account: 999_999,
+                    3 => EventBody::Deposit {
+                        account: 1_000 + i,
                         amount: Money(1),
                     },
                     _ => EventBody::Tick,
@@ -149,6 +154,46 @@ pub fn event_log_contract<L: EventLog>(make: &mut dyn FnMut() -> L) {
     assert!(fresh.append(1, &events[0]).is_err());
     fresh.append(0, &events[0]).unwrap();
     assert_eq!(fresh.len(), 1);
+}
+
+/// What every [`EventLog`] must do when it cannot hold more records. `make_small`
+/// returns a new, empty log that can hold at least one and fewer than 5 000 of
+/// the [`scenario_events`].
+///
+/// Checked: the refusal is [`PortErrorKind::Full`]; it stores nothing (length,
+/// head and replay are exactly those before the refused append) and repeats on
+/// every retry; the records stored before it stay readable.
+pub fn event_log_full_contract<L: EventLog>(make_small: &mut dyn FnMut() -> L) {
+    let events = scenario_events(5_000);
+    let mut log = make_small();
+    let mut stored = 0u64;
+    let mut refused = None;
+    for (i, ev) in events.iter().enumerate() {
+        match log.append(i as u64, ev) {
+            Ok(()) => stored += 1,
+            Err(e) => {
+                refused = Some((i, e));
+                break;
+            }
+        }
+    }
+    let (at, err) = refused.expect("a small log must fill up");
+    assert!(stored >= 1, "the small log must hold at least one record");
+    assert_eq!(at as u64, stored);
+    assert_eq!(err.kind, PortErrorKind::Full, "{err}");
+    assert_eq!(log.len(), stored, "a refused append stores nothing");
+    let head = log.head();
+    for _ in 0..3 {
+        assert_eq!(
+            log.append(stored, &events[at]).unwrap_err().kind,
+            PortErrorKind::Full
+        );
+        assert_eq!(log.len(), stored);
+        assert_eq!(log.head(), head);
+    }
+    let got: Vec<_> = collect(&mut log, 0).into_iter().map(|(_, e)| e).collect();
+    assert_eq!(got, events[..stored as usize].to_vec());
+    log.sync().unwrap();
 }
 
 /// Semantics every [`SnapshotStore`] must have. `make` returns a new, empty,
@@ -262,14 +307,25 @@ mod tests {
     }
 
     #[test]
-    fn scenario_is_deterministic_and_has_rejections() {
+    fn in_memory_log_satisfies_the_full_contract() {
+        event_log_full_contract(&mut || InMemoryEventLog::with_capacity_limit(4));
+    }
+
+    #[test]
+    fn scenario_is_deterministic_has_logged_rejections_and_no_precheck_rejections() {
         let a = scenario_events(30);
         assert_eq!(a, scenario_events(30));
         assert!(matches!(a[0].body, EventBody::Configure(_)));
         assert!(a.windows(2).all(|w| w[0].ts <= w[1].ts));
-        assert!(a
-            .iter()
-            .any(|e| matches!(e.body, EventBody::Withdraw { .. })));
+        let mut engine = Engine::new();
+        let mut rejected = 0;
+        for ev in &a {
+            engine.precheck(ev).unwrap();
+            if engine.apply(ev).is_err() {
+                rejected += 1;
+            }
+        }
+        assert!(rejected > 0, "the engine rejects some events");
         assert_eq!(run_scenario(30).events_applied(), 30);
         assert_eq!(run_scenario(30).state_hash(), run_scenario(30).state_hash());
         assert_ne!(run_scenario(30).state_hash(), run_scenario(29).state_hash());

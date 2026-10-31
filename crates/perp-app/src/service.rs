@@ -4,12 +4,28 @@
 //! [`ExchangeService`] owns one [`Engine`] and three ports: an [`EventLog`], a
 //! [`SnapshotStore`] and a [`Clock`]. Its rules are:
 //!
-//! * **Log first.** An event is appended to the log before the engine sees it.
-//!   If the append fails, the engine is not touched. If the engine rejects the
-//!   event, it stays in the log, because replay must reproduce the rejection and
-//!   the counter exactly.
+//! * **Cheap rejections are not logged.** [`Engine::precheck`] rejects events
+//!   that cannot succeed whatever the state is (unknown account, market or
+//!   order, zero amounts, bad ranges, time regression, not configured). Such an
+//!   event is neither logged nor applied, so a flood of invalid requests cannot
+//!   grow the log.
+//! * **Log first.** An event that passed the precheck is appended to the log
+//!   before the engine sees it. If the append fails, the engine is not touched.
+//!   If the engine then rejects the event for a state-dependent reason (margin,
+//!   fill-or-kill, ...), it stays in the log, because replay must reproduce the
+//!   rejection and the counter exactly.
 //! * **A halted engine logs nothing.** After an internal inconsistency the
 //!   engine refuses every event; the service does not append them.
+//! * **A full log degrades to read-only.** When the log reports
+//!   [`PortErrorKind::Full`] the service enters read-only mode: that event and
+//!   every later state-changing call fail with [`ServiceError::ReadOnly`]
+//!   (nothing is logged or applied) while queries keep working. See
+//!   [`ExchangeService::is_read_only`] for how an operator recovers. Any other
+//!   storage failure stays [`ServiceError::Storage`].
+//! * **Bounded clock steps.** [`ExchangeService::submit`] stamps events with the
+//!   clock, but event time advances by at most
+//!   [`ServiceConfig::max_time_step_ms`] per event, so one wild clock reading
+//!   cannot be written to the log in full.
 //! * **Recovery** loads the newest valid snapshot (or starts from an empty
 //!   engine) and replays the log from the snapshot's sequence number, ignoring
 //!   the engine's business errors.
@@ -23,7 +39,7 @@
 //! network adapter serialises access.
 
 use crate::api::{ApiError, ExchangeApi};
-use crate::ports::{Clock, EventLog, PortError, SnapshotStore};
+use crate::ports::{Clock, EventLog, PortError, PortErrorKind, SnapshotStore};
 use perp_domain::engine::Engine;
 use perp_domain::error::Error;
 use perp_domain::sha256::Digest;
@@ -31,7 +47,7 @@ use perp_domain::types::{AccountId, Event, EventBody, MarketId, Millis, Output};
 use perp_domain::views::{AccountView, BookView, Summary};
 use std::fmt;
 
-/// Snapshot policy.
+/// Snapshot and clock policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceConfig {
     /// Take a snapshot after every this many applied events (accepted or
@@ -39,6 +55,10 @@ pub struct ServiceConfig {
     pub snapshot_every: u64,
     /// Snapshots to keep; values below 1 are treated as 1.
     pub keep_snapshots: usize,
+    /// Largest amount event time may advance between two consecutive events
+    /// stamped by [`ExchangeService::submit`], in milliseconds; 0 is treated as
+    /// 1. The first event of an empty engine is stamped with the clock as is.
+    pub max_time_step_ms: Millis,
 }
 
 impl Default for ServiceConfig {
@@ -46,6 +66,7 @@ impl Default for ServiceConfig {
         ServiceConfig {
             snapshot_every: 10_000,
             keep_snapshots: 3,
+            max_time_step_ms: 3_600_000,
         }
     }
 }
@@ -85,10 +106,15 @@ pub struct ReplayReport {
 /// Failure of a service operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceError {
-    /// The engine rejected the event (it is still in the log) or is halted.
+    /// The engine rejected the event (it is in the log unless the precheck
+    /// rejected it) or is halted.
     Engine(Error),
     /// A port failed.
     Storage(PortError),
+    /// The service is in degraded read-only mode (the log is full): nothing
+    /// was logged or applied. Queries still work; see
+    /// [`ExchangeService::is_read_only`].
+    ReadOnly(String),
     /// The newest valid snapshot is ahead of the log: the log lost records the
     /// snapshot already contains.
     SnapshotAheadOfLog {
@@ -106,6 +132,7 @@ impl fmt::Display for ServiceError {
         match self {
             ServiceError::Engine(e) => write!(f, "{e}"),
             ServiceError::Storage(e) => write!(f, "storage: {e}"),
+            ServiceError::ReadOnly(why) => write!(f, "read-only: {why}"),
             ServiceError::SnapshotAheadOfLog {
                 snapshot_seq,
                 log_records,
@@ -130,6 +157,7 @@ impl From<ServiceError> for ApiError {
     fn from(e: ServiceError) -> Self {
         match e {
             ServiceError::Engine(e) => ApiError::Engine(e),
+            ServiceError::ReadOnly(why) => ApiError::Degraded(why),
             other => ApiError::Storage(other.to_string()),
         }
     }
@@ -240,6 +268,7 @@ pub struct ExchangeService<L: EventLog, S: SnapshotStore, C: Clock> {
     cfg: ServiceConfig,
     last_ts: Millis,
     last_snapshot_error: Option<PortError>,
+    read_only: Option<String>,
 }
 
 impl<L: EventLog, S: SnapshotStore, C: Clock> ExchangeService<L, S, C> {
@@ -259,20 +288,43 @@ impl<L: EventLog, S: SnapshotStore, C: Clock> ExchangeService<L, S, C> {
             cfg,
             last_ts,
             last_snapshot_error: None,
+            read_only: None,
         };
         Ok((service, report))
     }
 
-    /// Log `ev`, then apply it. A rejection is returned as
-    /// [`ServiceError::Engine`] and the event stays logged. A halted engine
-    /// refuses the event with `Error::Halted` and nothing is logged. If the
-    /// log cannot store the event the engine is not touched.
+    /// Pre-check, log, then apply `ev`.
+    ///
+    /// * Read-only mode (the log was full): [`ServiceError::ReadOnly`], nothing
+    ///   logged or applied.
+    /// * A halted engine refuses the event with `Error::Halted`; nothing is
+    ///   logged.
+    /// * [`Engine::precheck`] rejects the event: [`ServiceError::Engine`],
+    ///   nothing is logged or applied, the applied-event counter does not move.
+    /// * The log is full: the service enters read-only mode and the call fails
+    ///   with [`ServiceError::ReadOnly`]; the engine is not touched.
+    /// * Any other log failure: [`ServiceError::Storage`]; the engine is not
+    ///   touched.
+    /// * The engine rejects the event for a state-dependent reason: the event
+    ///   stays logged (replay reproduces the rejection) and the rejection is
+    ///   returned as [`ServiceError::Engine`].
     pub fn apply_event(&mut self, ev: &Event) -> Result<Vec<Output>, ServiceError> {
+        if let Some(why) = &self.read_only {
+            return Err(ServiceError::ReadOnly(why.clone()));
+        }
         if self.engine.is_halted() {
             return Err(ServiceError::Engine(Error::Halted));
         }
+        self.engine.precheck(ev).map_err(ServiceError::Engine)?;
         let seq = self.engine.events_applied();
-        self.log.append(seq, ev)?;
+        if let Err(e) = self.log.append(seq, ev) {
+            if e.kind == PortErrorKind::Full {
+                let why = format!("the event log is full ({})", e.message);
+                self.read_only = Some(why.clone());
+                return Err(ServiceError::ReadOnly(why));
+            }
+            return Err(ServiceError::Storage(e));
+        }
         let result = self.engine.apply(ev);
         self.last_ts = self.last_ts.max(ev.ts);
         let every = self.cfg.snapshot_every;
@@ -285,10 +337,23 @@ impl<L: EventLog, S: SnapshotStore, C: Clock> ExchangeService<L, S, C> {
         result.map_err(ServiceError::Engine)
     }
 
-    /// Stamp `body` with `max(last event time, clock)` and apply it. Timestamps
-    /// therefore never go backwards even if the clock does.
+    /// Stamp `body` and apply it with [`ExchangeService::apply_event`].
+    ///
+    /// The timestamp is the clock reading limited to the range
+    /// `[last event time, last event time + max_time_step_ms]`: it never goes
+    /// backwards if the clock does, and it advances by at most one step per
+    /// event if the clock jumps forward (an NTP step, a VM resume), so a bad
+    /// reading is never logged in full and the engine catches up with the clock
+    /// step by step. While the engine is empty there is no previous event and
+    /// the clock is used as is.
     pub fn submit(&mut self, body: EventBody) -> Result<Vec<Output>, ServiceError> {
-        let ts = self.last_ts.max(self.clock.now_ms());
+        let now = self.clock.now_ms();
+        let ts = if self.engine.events_applied() == 0 {
+            now
+        } else {
+            let step = self.cfg.max_time_step_ms.max(1);
+            now.max(self.last_ts).min(self.last_ts.saturating_add(step))
+        };
         self.apply_event(&Event { ts, body })
     }
 
@@ -337,6 +402,16 @@ impl<L: EventLog, S: SnapshotStore, C: Clock> ExchangeService<L, S, C> {
     pub fn last_ts(&self) -> Millis {
         self.last_ts
     }
+
+    /// True once the log reported that it is full. Every state-changing call
+    /// then fails with [`ServiceError::ReadOnly`] while queries keep working.
+    ///
+    /// Recovery is an operator action: free disk space or raise the log size
+    /// limit (`serve --max-log-mib`), then restart the process; the log is
+    /// replayed from disk and the service starts in normal mode again.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.is_some()
+    }
 }
 
 impl<L, S, C> ExchangeApi for ExchangeService<L, S, C>
@@ -373,7 +448,7 @@ mod tests {
     use super::*;
     use crate::contract::{run_scenario, scenario_events};
     use crate::fakes::{InMemoryEventLog, InMemorySnapshotStore, ManualClock};
-    use crate::ports::{LoadedSnapshot, PortErrorKind};
+    use crate::ports::LoadedSnapshot;
     use perp_domain::fixed::Money;
 
     type Svc = ExchangeService<InMemoryEventLog, InMemorySnapshotStore, ManualClock>;
@@ -394,14 +469,19 @@ mod tests {
         }
 
         fn open(&self, every: u64, keep: usize) -> (Svc, RecoveryReport) {
+            self.open_cfg(ServiceConfig {
+                snapshot_every: every,
+                keep_snapshots: keep,
+                ..ServiceConfig::default()
+            })
+        }
+
+        fn open_cfg(&self, cfg: ServiceConfig) -> (Svc, RecoveryReport) {
             ExchangeService::open(
                 self.log.clone(),
                 self.snaps.clone(),
                 self.clock.clone(),
-                ServiceConfig {
-                    snapshot_every: every,
-                    keep_snapshots: keep,
-                },
+                cfg,
             )
             .unwrap()
         }
@@ -459,25 +539,87 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_event_stays_in_the_log_and_advances_the_counter() {
+    fn a_state_dependent_rejection_stays_in_the_log_and_advances_the_counter() {
         let rig = Rig::new();
         let (mut svc, _) = rig.open(0, 3);
-        feed(&mut svc, 3);
+        // The scenario configures three accounts and has opened all of them.
+        feed(&mut svc, 8);
         let before = svc.engine().events_applied();
         let bad = Event {
-            ts: 500,
-            body: EventBody::Withdraw {
+            ts: 10_000,
+            body: EventBody::Deposit {
                 account: 424_242,
                 amount: Money(5),
             },
         };
-        assert!(matches!(
+        // The pre-check cannot see the account limit; the engine rejects it.
+        assert_eq!(svc.engine().precheck(&bad), Ok(()));
+        assert_eq!(
             svc.apply_event(&bad),
-            Err(ServiceError::Engine(_))
-        ));
+            Err(ServiceError::Engine(Error::TooManyAccounts))
+        );
         assert_eq!(svc.engine().events_applied(), before + 1);
         assert_eq!(svc.log_len(), before + 1);
         assert_eq!(rig.log.events().last(), Some(&bad));
+        // Replay reproduces the rejection.
+        let (again, _) = replay_log(&mut rig.log.clone()).unwrap();
+        assert_eq!(again.state_hash(), svc.engine().state_hash());
+    }
+
+    #[test]
+    fn prechecked_rejections_are_neither_logged_nor_applied() {
+        let rig = Rig::new();
+        let (mut svc, _) = rig.open(0, 3);
+        feed(&mut svc, 10);
+        let (applied, len, head, last_ts) = (
+            svc.engine().events_applied(),
+            svc.log_len(),
+            svc.log_head(),
+            svc.last_ts(),
+        );
+        let hash = svc.engine().state_hash();
+        let junk = [
+            EventBody::Withdraw {
+                account: 424_242,
+                amount: Money(5),
+            },
+            EventBody::Deposit {
+                account: 1,
+                amount: Money(0),
+            },
+            EventBody::Cancel {
+                account: 2,
+                order_id: 99,
+            },
+            EventBody::Configure(Default::default()),
+        ];
+        for i in 0..2_000u64 {
+            let ev = Event {
+                ts: 1_000_000 + i,
+                body: junk[i as usize % junk.len()].clone(),
+            };
+            assert!(matches!(svc.apply_event(&ev), Err(ServiceError::Engine(_))));
+        }
+        // A regressed timestamp is also a cheap rejection.
+        let late = Event {
+            ts: 1,
+            body: EventBody::Tick,
+        };
+        assert_eq!(
+            svc.apply_event(&late),
+            Err(ServiceError::Engine(Error::TimeRegression))
+        );
+        assert_eq!(svc.log_len(), len, "the log did not grow");
+        assert_eq!(rig.log.len(), len);
+        assert_eq!(svc.log_head(), head);
+        assert_eq!(svc.engine().events_applied(), applied);
+        assert_eq!(svc.engine().state_hash(), hash);
+        assert_eq!(svc.last_ts(), last_ts, "a rejected event is not a time");
+        // The service keeps working and the log still replays identically.
+        svc.submit(EventBody::Tick).unwrap();
+        assert_eq!(svc.log_len(), len + 1);
+        let (again, _) = replay_log(&mut rig.log.clone()).unwrap();
+        assert_eq!(again.state_hash(), svc.engine().state_hash());
     }
 
     #[test]
@@ -645,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_log_refuses_events_without_applying_them() {
+    fn a_full_log_turns_the_service_read_only_without_applying_anything() {
         let log = InMemoryEventLog::with_capacity_limit(3);
         let (mut svc, _) = ExchangeService::open(
             log.clone(),
@@ -655,14 +797,99 @@ mod tests {
         )
         .unwrap();
         feed(&mut svc, 3);
+        assert!(!svc.is_read_only());
         let hash = svc.engine().state_hash();
+        let head = svc.log_head();
         let err = svc.apply_event(&scenario_events(4)[3]).unwrap_err();
-        assert!(matches!(
-            &err,
-            ServiceError::Storage(e) if e.kind == PortErrorKind::Full
-        ));
+        assert!(matches!(&err, ServiceError::ReadOnly(m) if m.contains("full")));
+        assert!(svc.is_read_only());
+        // Every later state-changing call is refused, whatever it is.
+        for _ in 0..3 {
+            assert!(matches!(
+                svc.apply_event(&scenario_events(4)[3]),
+                Err(ServiceError::ReadOnly(_))
+            ));
+            assert!(matches!(
+                svc.submit(EventBody::Tick),
+                Err(ServiceError::ReadOnly(_))
+            ));
+        }
         assert_eq!(svc.engine().state_hash(), hash);
+        assert_eq!(svc.engine().events_applied(), 3);
+        assert_eq!(svc.log_head(), head);
         assert_eq!(log.len(), 3);
+    }
+
+    #[test]
+    fn a_read_only_service_still_answers_queries_and_maps_to_degraded() {
+        let log = InMemoryEventLog::with_capacity_limit(3);
+        let (svc, _) = ExchangeService::open(
+            log.clone(),
+            InMemorySnapshotStore::new(),
+            ManualClock::new(0),
+            ServiceConfig::default(),
+        )
+        .unwrap();
+        let mut api: Box<dyn ExchangeApi> = Box::new(svc);
+        api.submit(EventBody::Configure(Default::default()))
+            .unwrap();
+        api.submit(EventBody::Deposit {
+            account: 7,
+            amount: Money(2_500_000),
+        })
+        .unwrap();
+        api.submit(EventBody::Tick).unwrap();
+        for _ in 0..2 {
+            let e = api.submit(EventBody::Tick).unwrap_err();
+            assert!(
+                matches!(&e, ApiError::Degraded(m) if m.contains("full")),
+                "{e}"
+            );
+        }
+        // Queries keep working.
+        assert_eq!(api.account(7).unwrap().collateral, Money(2_500_000));
+        assert_eq!(api.summary().events_applied, 3);
+        assert!(api.book(1, 5).is_none());
+    }
+
+    #[test]
+    fn restarting_with_more_room_resumes_normal_operation() {
+        let rig = Rig::new();
+        rig.log.set_capacity_limit(Some(5));
+        let (mut svc, _) = rig.open(0, 3);
+        feed(&mut svc, 5);
+        assert!(matches!(
+            svc.apply_event(&scenario_events(6)[5]),
+            Err(ServiceError::ReadOnly(_))
+        ));
+        assert!(svc.is_read_only());
+        let hash = svc.engine().state_hash();
+        drop(svc);
+        // The operator frees space / raises the limit and restarts.
+        rig.log.set_capacity_limit(None);
+        let (mut svc, rep) = rig.open(0, 3);
+        assert!(!svc.is_read_only());
+        assert_eq!(rep.log_records, 5);
+        assert_eq!(svc.engine().state_hash(), hash);
+        svc.apply_event(&scenario_events(6)[5]).unwrap();
+        assert_eq!(svc.log_len(), 6);
+    }
+
+    #[test]
+    fn other_storage_failures_are_not_read_only() {
+        let rig = Rig::new();
+        let (mut svc, _) = rig.open(0, 3);
+        feed(&mut svc, 4);
+        rig.log.set_fail_appends(true);
+        let err = svc.submit(EventBody::Tick).unwrap_err();
+        assert!(matches!(&err, ServiceError::Storage(e) if e.kind == PortErrorKind::Io));
+        assert!(!svc.is_read_only());
+        assert!(matches!(
+            ApiError::from(err),
+            ApiError::Storage(m) if m.contains("storage")
+        ));
+        rig.log.set_fail_appends(false);
+        svc.submit(EventBody::Tick).unwrap();
     }
 
     #[test]
@@ -680,6 +907,7 @@ mod tests {
             ServiceConfig {
                 snapshot_every: 1,
                 keep_snapshots: 3,
+                ..ServiceConfig::default()
             },
         )
         .unwrap();
@@ -757,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_regressed_timestamp_is_rejected_and_logged() {
+    fn an_explicit_regressed_timestamp_is_rejected_and_not_logged() {
         let rig = Rig::new();
         let (mut svc, _) = rig.open(0, 3);
         feed(&mut svc, 5);
@@ -765,14 +993,107 @@ mod tests {
             ts: 1,
             body: EventBody::Tick,
         };
-        assert!(matches!(
+        assert_eq!(
             svc.apply_event(&late),
-            Err(ServiceError::Engine(_))
-        ));
-        assert_eq!(svc.log_len(), 6);
-        // Replay reproduces the same state, rejection included.
+            Err(ServiceError::Engine(Error::TimeRegression))
+        );
+        assert_eq!(svc.log_len(), 5);
+        assert_eq!(svc.engine().events_applied(), 5);
         let (again, _) = replay_log(&mut rig.log.clone()).unwrap();
         assert_eq!(again.state_hash(), svc.engine().state_hash());
+    }
+
+    #[test]
+    fn a_huge_forward_clock_jump_advances_time_by_one_step_per_event() {
+        let rig = Rig::new();
+        let (mut svc, _) = rig.open(0, 3);
+        rig.clock.set(1_000);
+        svc.submit(EventBody::Configure(Default::default()))
+            .unwrap();
+        let step = ServiceConfig::default().max_time_step_ms;
+        assert_eq!(step, 3_600_000);
+        // NTP step / VM resume: the clock suddenly reads a year ahead.
+        rig.clock.set(1_000 + 365 * 86_400_000);
+        for k in 1..=4u64 {
+            svc.submit(EventBody::Tick).unwrap();
+            assert_eq!(svc.last_ts(), 1_000 + k * step, "event {k}");
+        }
+        let ts: Vec<u64> = rig.log.events().iter().map(|e| e.ts).collect();
+        assert_eq!(
+            ts,
+            vec![
+                1_000,
+                1_000 + step,
+                1_000 + 2 * step,
+                1_000 + 3 * step,
+                1_000 + 4 * step
+            ]
+        );
+        // The clock comes back: time never regresses, and the engine follows
+        // the clock again as soon as it passes the last event time.
+        let last = svc.last_ts();
+        rig.clock.set(5_000);
+        svc.submit(EventBody::Tick).unwrap();
+        assert_eq!(svc.last_ts(), last);
+        rig.clock.set(last + 25);
+        svc.submit(EventBody::Tick).unwrap();
+        assert_eq!(svc.last_ts(), last + 25);
+    }
+
+    #[test]
+    fn the_first_event_of_an_empty_service_uses_the_clock_as_is() {
+        let rig = Rig::new();
+        let (mut svc, _) = rig.open(0, 3);
+        rig.clock.set(9_000_000_000_000);
+        svc.submit(EventBody::Configure(Default::default()))
+            .unwrap();
+        assert_eq!(svc.last_ts(), 9_000_000_000_000);
+        // Later events are limited again.
+        rig.clock.set(9_000_000_000_000 + 10 * 3_600_000);
+        svc.submit(EventBody::Tick).unwrap();
+        assert_eq!(svc.last_ts(), 9_000_000_000_000 + 3_600_000);
+    }
+
+    #[test]
+    fn a_restart_after_a_long_downtime_catches_up_step_by_step() {
+        let rig = Rig::new();
+        let cfg = ServiceConfig {
+            snapshot_every: 0,
+            max_time_step_ms: 100,
+            ..ServiceConfig::default()
+        };
+        let (mut svc, _) = rig.open_cfg(cfg);
+        rig.clock.set(1_000);
+        svc.submit(EventBody::Configure(Default::default()))
+            .unwrap();
+        drop(svc);
+        // Down for far longer than one step.
+        rig.clock.set(1_000 + 450);
+        let (mut svc, _) = rig.open_cfg(cfg);
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            svc.submit(EventBody::Tick).unwrap();
+            seen.push(svc.last_ts());
+        }
+        assert_eq!(seen, vec![1_100, 1_200, 1_300, 1_400, 1_450, 1_450]);
+    }
+
+    #[test]
+    fn a_zero_time_step_is_treated_as_one_millisecond() {
+        let rig = Rig::new();
+        let cfg = ServiceConfig {
+            snapshot_every: 0,
+            max_time_step_ms: 0,
+            ..ServiceConfig::default()
+        };
+        let (mut svc, _) = rig.open_cfg(cfg);
+        rig.clock.set(500);
+        svc.submit(EventBody::Configure(Default::default()))
+            .unwrap();
+        rig.clock.set(1_000_000);
+        svc.submit(EventBody::Tick).unwrap();
+        svc.submit(EventBody::Tick).unwrap();
+        assert_eq!(svc.last_ts(), 502);
     }
 
     #[test]
@@ -1004,7 +1325,7 @@ mod tests {
         let rig = Rig::new();
         let (svc, _) = rig.open(0, 3);
         let mut api: Box<dyn ExchangeApi> = Box::new(svc);
-        // Rejected by the engine (not configured yet or unknown account).
+        // Not configured yet: rejected by the pre-check, nothing is logged.
         let e = api
             .submit(EventBody::Withdraw {
                 account: 1,
@@ -1012,6 +1333,18 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(e, ApiError::Engine(_)));
+        assert_eq!(api.summary().events_applied, 0);
+        api.submit(EventBody::Configure(Default::default()))
+            .unwrap();
+        // Unknown account: also a pre-check rejection.
+        let e = api
+            .submit(EventBody::Withdraw {
+                account: 1,
+                amount: Money(1),
+            })
+            .unwrap_err();
+        assert_eq!(e, ApiError::Engine(Error::UnknownAccount));
+        assert_eq!(api.summary().events_applied, 1);
         // Storage failure: not applied.
         rig.log.set_fail_appends(true);
         let e = api.submit(EventBody::Tick).unwrap_err();
@@ -1026,6 +1359,14 @@ mod tests {
             "inconsistent state: x"
         );
         let s: ServiceError = PortError::new(PortErrorKind::Corrupt, "bad").into();
+        assert_eq!(
+            ServiceError::ReadOnly("disk".into()).to_string(),
+            "read-only: disk"
+        );
+        assert_eq!(
+            ApiError::from(ServiceError::ReadOnly("disk".into())),
+            ApiError::Degraded("disk".into())
+        );
         assert!(s.to_string().starts_with("storage: "));
         assert_eq!(
             ApiError::from(ServiceError::Engine(Error::Halted)),
@@ -1042,5 +1383,6 @@ mod tests {
         let c = ServiceConfig::default();
         assert_eq!(c.snapshot_every, 10_000);
         assert_eq!(c.keep_snapshots, 3);
+        assert_eq!(c.max_time_step_ms, 3_600_000);
     }
 }
