@@ -10,8 +10,8 @@
 )]
 
 use perp_app::contract::{
-    event_log_contract, run_scenario, scenario_events, snapshot_store_contract,
-    snapshot_store_skips_damaged_contract,
+    event_log_contract, event_log_full_contract, run_scenario, scenario_events,
+    snapshot_store_contract, snapshot_store_skips_damaged_contract,
 };
 use perp_app::fakes::{InMemoryEventLog, ManualClock};
 use perp_app::ports::{EventLog, PortErrorKind, SnapshotStore};
@@ -63,6 +63,7 @@ fn wal_cfg(fsync: FsyncPolicy) -> WalConfig {
     WalConfig {
         fsync,
         max_file_bytes: 1 << 30,
+        ..WalConfig::default()
     }
 }
 
@@ -81,6 +82,7 @@ fn try_open(
         ServiceConfig {
             snapshot_every: every,
             keep_snapshots: keep,
+            ..ServiceConfig::default()
         },
     )
 }
@@ -251,6 +253,14 @@ fn recovery_after_a_crash_at_every_byte_offset_of_the_log() {
         drop(svc);
         let v = verify(work.wal()).unwrap();
         assert_eq!(v.torn_bytes, 0, "cut {cut}: log is clean after repair");
+        // Whatever the repair dropped was saved first, exactly.
+        let side = work.path().join(format!("engine.wal.torn-{boundary}"));
+        if cut >= HEADER_LEN as usize && cut > boundary {
+            assert_eq!(std::fs::read(&side).unwrap(), &bytes[boundary..cut]);
+            std::fs::remove_file(&side).unwrap();
+        } else {
+            assert!(!side.exists(), "cut {cut}: nothing to save");
+        }
     }
 }
 
@@ -463,7 +473,7 @@ fn repeated_crash_and_restart_cycles_converge_on_the_same_state() {
 }
 
 #[test]
-fn a_full_log_file_refuses_events_and_the_engine_stays_in_step() {
+fn a_full_log_file_turns_the_service_read_only_and_a_bigger_limit_resumes() {
     let dir = TempDir::new("full");
     // Room for the header and a handful of records only.
     let probe = TempDir::new("full-probe");
@@ -474,20 +484,124 @@ fn a_full_log_file_refuses_events_and_the_engine_stays_in_step() {
     let cfg = WalConfig {
         fsync: FsyncPolicy::Never,
         max_file_bytes: limit,
+        ..WalConfig::default()
     };
     let (mut svc, _) = try_open(dir.path(), 0, 3, cfg).unwrap();
     feed(&mut svc, 0, 6);
     let hash = svc.engine().state_hash();
     let err = svc.apply_event(&scenario_events(7)[6]).unwrap_err();
+    assert!(
+        matches!(&err, ServiceError::ReadOnly(m) if m.contains("size limit")),
+        "{err:?}"
+    );
+    assert!(svc.is_read_only());
+    // Later state-changing calls are refused; queries still work.
     assert!(matches!(
-        &err,
-        ServiceError::Storage(e) if e.kind == PortErrorKind::Full
+        svc.submit(perp_domain::types::EventBody::Tick),
+        Err(ServiceError::ReadOnly(_))
     ));
+    assert!(svc.engine().account_view(2).is_some());
     assert_eq!(svc.engine().state_hash(), hash);
     assert_eq!(svc.engine().events_applied(), 6);
+    assert_eq!(svc.log_len(), 6);
     drop(svc);
-    let (svc, rep) = open(dir.path(), 0, 3);
+    assert_eq!(std::fs::metadata(dir.wal()).unwrap().len(), limit);
+    // Same limit: still read-only after the next refused event.
+    let (mut svc, rep) = try_open(dir.path(), 0, 3, cfg).unwrap();
     assert_eq!(rep.log_records, 6);
+    assert!(
+        !svc.is_read_only(),
+        "the mode is not persisted; the next append finds it again"
+    );
+    assert!(matches!(
+        svc.apply_event(&scenario_events(7)[6]),
+        Err(ServiceError::ReadOnly(_))
+    ));
+    drop(svc);
+    // The operator raises the limit and restarts: writes resume.
+    let bigger = WalConfig {
+        max_file_bytes: limit * 4,
+        ..cfg
+    };
+    let (mut svc, rep) = try_open(dir.path(), 0, 3, bigger).unwrap();
+    assert_eq!(rep.log_records, 6);
+    assert!(!svc.is_read_only());
+    assert_eq!(svc.engine().state_hash(), hash);
+    svc.apply_event(&scenario_events(7)[6]).unwrap();
+    assert_eq!(svc.log_len(), 7);
+    assert!(!svc.is_read_only());
+}
+
+#[test]
+fn file_event_log_satisfies_the_full_contract() {
+    let root = TempDir::new("contract-full");
+    let mut n = 0;
+    event_log_full_contract(&mut || {
+        n += 1;
+        let cfg = WalConfig {
+            fsync: FsyncPolicy::Never,
+            // The header plus a handful of records.
+            max_file_bytes: HEADER_LEN + 400,
+            ..WalConfig::default()
+        };
+        FileEventLog::open(root.path().join(format!("full-{n}.wal")), cfg).unwrap()
+    });
+}
+
+#[test]
+fn a_flood_of_prechecked_rejections_grows_the_log_file_by_zero_bytes() {
+    use perp_domain::fixed::Money;
+    use perp_domain::types::{Event, EventBody};
+    let dir = TempDir::new("flood");
+    let (mut svc, _) = open(dir.path(), 0, 3);
+    feed(&mut svc, 0, 10);
+    let size = std::fs::metadata(dir.wal()).unwrap().len();
+    let (len, applied, hash) = (
+        svc.log_len(),
+        svc.engine().events_applied(),
+        svc.engine().state_hash(),
+    );
+    for i in 0..5_000u64 {
+        let body = match i % 3 {
+            0 => EventBody::Withdraw {
+                account: 777_000 + i,
+                amount: Money(1),
+            },
+            1 => EventBody::Deposit {
+                account: 1,
+                amount: Money(0),
+            },
+            _ => EventBody::Cancel {
+                account: 2,
+                order_id: 424_242 + i,
+            },
+        };
+        let ev = Event {
+            ts: 1_000_000 + i,
+            body,
+        };
+        assert!(matches!(svc.apply_event(&ev), Err(ServiceError::Engine(_))));
+    }
+    assert_eq!(std::fs::metadata(dir.wal()).unwrap().len(), size);
+    assert_eq!(svc.log_len(), len);
+    assert_eq!(svc.engine().events_applied(), applied);
+    assert_eq!(svc.engine().state_hash(), hash);
+    drop(svc);
+    // State-dependent rejections are still logged and replay identically.
+    let (mut svc, _) = open(dir.path(), 0, 3);
+    let logged = Event {
+        ts: 2_000_000,
+        body: EventBody::Deposit {
+            account: 31_337,
+            amount: Money(5),
+        },
+    };
+    assert!(svc.apply_event(&logged).is_err());
+    assert_eq!(svc.log_len(), len + 1);
+    assert!(std::fs::metadata(dir.wal()).unwrap().len() > size);
+    let hash = svc.engine().state_hash();
+    drop(svc);
+    let (svc, _) = open(dir.path(), 0, 3);
     assert_eq!(svc.engine().state_hash(), hash);
 }
 
@@ -594,4 +708,48 @@ fn file_snapshot_store_reports_io_errors_as_port_errors() {
     let err = store.save(&run_scenario(3)).unwrap_err();
     assert_eq!(err.kind, PortErrorKind::Io);
     assert_eq!(store.dir(), file.as_path());
+}
+
+#[test]
+fn a_complete_but_damaged_final_record_is_refused_until_repair_is_requested() {
+    let dir = TempDir::new("damaged-tail");
+    let (mut svc, _) = open(dir.path(), 0, 3);
+    feed(&mut svc, 0, 10);
+    drop(svc);
+    let mut bytes = std::fs::read(dir.wal()).unwrap();
+    let bounds = boundaries(&bytes);
+    bytes[bounds[9] + 6] ^= 0x01;
+    std::fs::write(dir.wal(), &bytes).unwrap();
+    // Opening a service on it fails and does not touch the file.
+    let err = FileEventLog::open(dir.wal(), wal_cfg(FsyncPolicy::Never)).unwrap_err();
+    assert!(
+        matches!(err, WalError::DamagedTail { offset, .. } if offset == bounds[9] as u64),
+        "{err}"
+    );
+    let port: perp_app::ports::PortError = err.into();
+    assert_eq!(port.kind, PortErrorKind::Corrupt);
+    assert_eq!(std::fs::read(dir.wal()).unwrap(), bytes, "file untouched");
+    // The read-only tools report it without repairing.
+    assert!(verify(dir.wal()).unwrap().damaged_tail);
+    assert!(
+        ReadOnlyFileLog::open(dir.wal())
+            .unwrap()
+            .report()
+            .damaged_tail
+    );
+    assert_eq!(std::fs::read(dir.wal()).unwrap(), bytes, "file untouched");
+    // The explicit repair option saves the record and truncates.
+    let repair = WalConfig {
+        repair_damaged_tail: true,
+        ..wal_cfg(FsyncPolicy::Never)
+    };
+    let (svc, rep) = try_open(dir.path(), 0, 3, repair).unwrap();
+    assert_eq!(rep.log_records, 9);
+    assert_eq!(rep.repaired_bytes, (bounds[10] - bounds[9]) as u64);
+    assert_eq!(svc.engine().state_hash(), run_scenario(9).state_hash());
+    drop(svc);
+    let side = dir.path().join(format!("engine.wal.torn-{}", bounds[9]));
+    assert_eq!(std::fs::read(side).unwrap(), &bytes[bounds[9]..]);
+    assert_eq!(std::fs::read(dir.wal()).unwrap(), &bytes[..bounds[9]]);
+    assert_eq!(verify(dir.wal()).unwrap().torn_bytes, 0);
 }

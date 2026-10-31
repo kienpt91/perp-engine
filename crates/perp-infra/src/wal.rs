@@ -20,15 +20,39 @@
 //! file is scanned (by [`Wal::open`], [`WalReader`] or [`verify`]) the first
 //! record that cannot be read is classified as follows:
 //!
-//! * **Torn tail**: the record is incomplete, or it fails verification, or
-//!   everything from there to the end of the file is zero bytes, *and* no
-//!   later record can be found that verifies against the hash chain. [`Wal::open`]
-//!   truncates the file to the last valid record boundary; the read-only
-//!   functions report the extra bytes and leave the file alone.
+//! * **Torn tail**: the record is *incomplete* (partial length field, a length
+//!   field that is not a valid record length, or fewer bytes than the length
+//!   field claims), or everything from there to the end of the file is zero
+//!   bytes, *and* no later record can be found that verifies against the hash
+//!   chain. [`Wal::open`] repairs it automatically: the dropped bytes are first
+//!   copied to a sidecar file next to the log (see below), flushed and synced,
+//!   and only then is the file truncated to the last valid record boundary.
+//! * **Damaged tail** ([`WalError::DamagedTail`]): the final record is
+//!   *complete* (valid length field, all of its bytes present) but fails
+//!   verification, and no later record exists. That is what a bit flip or
+//!   tampering with a durable, acknowledged record looks like, so [`Wal::open`]
+//!   does **not** remove it: it returns the error and leaves the file
+//!   untouched. Only [`WalConfig::repair_damaged_tail`] (the explicit repair
+//!   option) saves the bytes to the sidecar and truncates. The read-only
+//!   functions report it ([`Tail::Damaged`], [`VerifyReport::damaged_tail`]).
 //! * **Corruption** ([`WalError::Corrupt`]): the damaged record is followed by
 //!   data that still contains a self-consistent record, or the damaged
 //!   region is longer than one maximum-size record and is not all zeros. Nothing
 //!   is modified.
+//!
+//! # Sidecar
+//!
+//! Whenever [`Wal::open`] drops bytes it first writes them, exactly, to
+//! `<log file name>.torn-<offset>` in the same directory (`<offset>` is the byte
+//! offset where they started; a numeric suffix `.1`, `.2`, ... is added when the
+//! name is taken). The file is created with `create_new` (an existing file is
+//! never overwritten), flushed and synced, and the directory is synced, before
+//! the log is truncated. If the sidecar cannot be written the log is left
+//! untouched and the open fails. The dropped region is at most one maximum-size
+//! record (about 64 KiB), except for an all-zero tail: a zero tail longer than
+//! that carries no information and is truncated without a sidecar
+//! ([`OpenReport::sidecar`] is `None`). A file that is only a strict prefix of
+//! the header (creation was interrupted) is rewritten without a sidecar.
 //!
 //! "A later record that verifies" is found by looking at every offset in the
 //! damaged region (at most one maximum-size record, about 64 KiB) and checking the
@@ -53,8 +77,10 @@
 //!   log. It does not authenticate: anyone who can write the file can rewrite
 //!   the whole chain. Dropping whole records from the end of the file (or the
 //!   whole file) is not detectable by the file alone.
-//! * Damage that happens to leave exactly one self-consistent torn record at the
-//!   end is indistinguishable from a torn write, so such a record is dropped.
+//! * An incomplete final record (including one whose length field was damaged
+//!   into a larger or invalid value) is indistinguishable from a torn write and
+//!   is removed automatically; its bytes are kept in the sidecar. A complete but
+//!   damaged final record is never removed without the explicit repair option.
 //! * A single writer is assumed. There is no cross-process locking and no
 //!   log rotation in this version; the file only grows, up to
 //!   [`WalConfig::max_file_bytes`].
@@ -65,6 +91,7 @@ use perp_app::ports::{EventLog, PortError, PortErrorKind};
 use perp_domain::codec::{Decode, Encode, Reader, Writer};
 use perp_domain::sha256::{ct_eq, sha256, sha256_concat, Digest};
 use perp_domain::types::Event;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -147,6 +174,18 @@ pub enum WalError {
     RecordTooLarge,
     /// Appending would exceed [`WalConfig::max_file_bytes`].
     Full,
+    /// The final record is complete (valid length, all bytes present) but
+    /// fails verification and nothing valid follows. It may be a durable,
+    /// acknowledged event that was damaged after the fact, so it was **not**
+    /// removed and the file is untouched. Opening with
+    /// [`WalConfig::repair_damaged_tail`] saves the bytes to a sidecar file and
+    /// truncates.
+    DamagedTail {
+        /// Byte offset where the damaged record starts.
+        offset: u64,
+        /// Size on disk of the damaged record as claimed by its length field.
+        record_len: u64,
+    },
 }
 
 impl fmt::Display for WalError {
@@ -162,6 +201,13 @@ impl fmt::Display for WalError {
             }
             WalError::RecordTooLarge => write!(f, "wal record too large"),
             WalError::Full => write!(f, "wal file size limit reached"),
+            WalError::DamagedTail { offset, record_len } => write!(
+                f,
+                "wal final record at byte {offset} ({record_len} bytes) is complete but fails \
+                 verification; it was not removed. Inspect the file, then pass the explicit \
+                 repair option (serve --repair) to save it to a .torn-{offset} sidecar and \
+                 truncate"
+            ),
         }
     }
 }
@@ -203,6 +249,11 @@ pub struct WalConfig {
     /// Largest allowed file size in bytes, header included; `append` returns
     /// [`WalError::Full`] beyond it.
     pub max_file_bytes: u64,
+    /// Allow [`Wal::open`] to remove a *complete but damaged* final record
+    /// (after saving it to a sidecar file). When false (the default) such a
+    /// tail makes `open` fail with [`WalError::DamagedTail`] and the file is
+    /// left untouched. Genuinely torn (incomplete) tails are always repaired.
+    pub repair_damaged_tail: bool,
 }
 
 impl Default for WalConfig {
@@ -210,6 +261,7 @@ impl Default for WalConfig {
         WalConfig {
             fsync: FsyncPolicy::Always,
             max_file_bytes: 1 << 30,
+            repair_damaged_tail: false,
         }
     }
 }
@@ -225,6 +277,9 @@ pub struct OpenReport {
     pub truncated_bytes: u64,
     /// Chain value after the last valid record.
     pub chain_head: Digest,
+    /// Sidecar file the dropped bytes were saved to, when any bytes were
+    /// dropped and they are worth keeping (see the module documentation).
+    pub sidecar: Option<PathBuf>,
 }
 
 /// State of the end of a log after a full read.
@@ -238,6 +293,16 @@ pub enum Tail {
         valid_len: u64,
         /// Number of trailing bytes after `valid_len`.
         extra_bytes: u64,
+    },
+    /// The final record is complete but fails verification (see
+    /// [`WalError::DamagedTail`]). Not repaired by [`Wal::open`] unless asked.
+    Damaged {
+        /// Length the file would be truncated to.
+        valid_len: u64,
+        /// Number of trailing bytes after `valid_len`.
+        extra_bytes: u64,
+        /// Size on disk of the damaged record claimed by its length field.
+        record_len: u64,
     },
 }
 
@@ -254,6 +319,9 @@ pub struct VerifyReport {
     pub file_len: u64,
     /// Bytes of torn tail (reported, not repaired).
     pub torn_bytes: u64,
+    /// True when the tail is a complete but damaged final record (as opposed
+    /// to an incomplete, torn one). `torn_bytes` then counts that record too.
+    pub damaged_tail: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -301,7 +369,11 @@ enum Attempt {
 enum Step {
     Record(u64, Box<Event>),
     End,
-    Torn { extra: u64 },
+    Torn {
+        extra: u64,
+        /// Size on disk of the damaged final record when it is complete.
+        damaged_record: Option<u64>,
+    },
 }
 
 /// Sequential, bounded-memory record scanner shared by all readers.
@@ -400,7 +472,10 @@ impl Scanner {
     fn classify(&mut self, start: u64, rem: u64, f: &Failure) -> Result<Step, WalError> {
         self.reader.seek(SeekFrom::Start(start))?;
         if self.tail_is_zero(rem)? {
-            return Ok(Step::Torn { extra: rem });
+            return Ok(Step::Torn {
+                extra: rem,
+                damaged_record: None,
+            });
         }
         if rem > MAX_TORN_TAIL {
             return Err(WalError::Corrupt {
@@ -421,7 +496,10 @@ impl Scanner {
                 why: "damaged record is followed by valid records",
             });
         }
-        Ok(Step::Torn { extra: rem })
+        Ok(Step::Torn {
+            extra: rem,
+            damaged_record: f.claimed.map(|(total, _)| total as u64),
+        })
     }
 
     /// True when the next `rem` bytes from the current position are all zero.
@@ -504,14 +582,77 @@ fn frame_len(payload_len: usize) -> Result<usize, WalError> {
     Ok(LEN_FIELD + payload_len + CHAIN_LEN)
 }
 
+/// Most numeric suffixes tried when a sidecar name is taken.
+const MAX_SIDECAR_SUFFIX: u32 = 1_000;
+
+/// Copy the bytes `offset..file_len` of `file` to a new sidecar file next to
+/// `path`, flush and sync it and its directory entry. Returns `None` for a
+/// region longer than one maximum-size record (only an all-zero tail can be
+/// that long; it holds no information).
+fn save_dropped_tail(
+    file: &mut File,
+    path: &Path,
+    offset: u64,
+    file_len: u64,
+) -> Result<Option<PathBuf>, WalError> {
+    let extra = file_len.saturating_sub(offset);
+    if extra == 0 || extra > MAX_TORN_TAIL {
+        return Ok(None);
+    }
+    let n = usize::try_from(extra).map_err(|_| WalError::Corrupt {
+        offset,
+        why: "torn tail too large",
+    })?;
+    let mut bytes = vec![0u8; n];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut bytes)?;
+    let base = path.file_name().unwrap_or_else(|| OsStr::new("wal"));
+    for attempt in 0..=MAX_SIDECAR_SUFFIX {
+        let mut name = base.to_os_string();
+        name.push(format!(".torn-{offset}"));
+        if attempt > 0 {
+            name.push(format!(".{attempt}"));
+        }
+        let candidate = path.with_file_name(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut side) => {
+                let written = side
+                    .write_all(&bytes)
+                    .and_then(|()| side.flush())
+                    .and_then(|()| side.sync_all())
+                    .and_then(|()| sync_dir(parent_dir(path)));
+                if let Err(e) = written {
+                    drop(side);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(WalError::Io(e));
+                }
+                return Ok(Some(candidate));
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(WalError::Io(e)),
+        }
+    }
+    Err(WalError::Io(io::Error::other(
+        "too many torn-tail sidecar files next to the log",
+    )))
+}
+
 impl Wal {
     /// Open (creating if missing) the log at `path` for appending.
     ///
-    /// The whole file is scanned and verified. A torn tail is truncated away
-    /// and synced; mid-file corruption returns [`WalError::Corrupt`] and leaves
-    /// the file untouched. A file that is a strict prefix of a valid header
-    /// (creation was interrupted) is rewritten with a fresh header; any other
-    /// short or wrong header is [`WalError::BadHeader`].
+    /// The whole file is scanned and verified. A torn (incomplete) tail is
+    /// saved to a sidecar file (see the module documentation), then truncated
+    /// away and synced. A complete but damaged final record is refused with
+    /// [`WalError::DamagedTail`] and the file is left untouched unless
+    /// [`WalConfig::repair_damaged_tail`] is set. Mid-file corruption returns
+    /// [`WalError::Corrupt`] and leaves the file untouched. A file that is a
+    /// strict prefix of a valid header (creation was interrupted) is rewritten
+    /// with a fresh header; any other short or wrong header is
+    /// [`WalError::BadHeader`].
     pub fn open(path: impl AsRef<Path>, cfg: WalConfig) -> Result<(Wal, OpenReport), WalError> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
@@ -520,6 +661,7 @@ impl Wal {
             .create(true)
             .open(path)?;
         let file_len = file.metadata()?.len();
+        let mut sidecar = None;
         let (valid_len, records, chain, truncated) = match check_header(&mut file, file_len)? {
             HeaderState::TornCreation => {
                 file.set_len(0)?;
@@ -530,8 +672,29 @@ impl Wal {
             }
             HeaderState::Valid => {
                 let mut sc = Scanner::new(file.try_clone()?, file_len)?;
-                while let Step::Record(..) = sc.next()? {}
+                let mut damaged_record = None;
+                loop {
+                    match sc.next()? {
+                        Step::Record(..) => {}
+                        Step::End => break,
+                        Step::Torn {
+                            damaged_record: d, ..
+                        } => {
+                            damaged_record = d;
+                            break;
+                        }
+                    }
+                }
                 if sc.offset < file_len {
+                    if let Some(record_len) = damaged_record {
+                        if !cfg.repair_damaged_tail {
+                            return Err(WalError::DamagedTail {
+                                offset: sc.offset,
+                                record_len,
+                            });
+                        }
+                    }
+                    sidecar = save_dropped_tail(&mut file, path, sc.offset, file_len)?;
                     file.set_len(sc.offset)?;
                     file.sync_all()?;
                 }
@@ -548,6 +711,7 @@ impl Wal {
             valid_len,
             truncated_bytes: truncated,
             chain_head: chain,
+            sidecar,
         };
         let wal = Wal {
             file,
@@ -743,10 +907,20 @@ impl WalReader {
                 self.state = ReaderState::Done(Tail::Clean);
                 Ok(None)
             }
-            Ok(Step::Torn { extra }) => {
-                self.state = ReaderState::Done(Tail::Torn {
-                    valid_len: sc.offset,
-                    extra_bytes: extra,
+            Ok(Step::Torn {
+                extra,
+                damaged_record,
+            }) => {
+                self.state = ReaderState::Done(match damaged_record {
+                    None => Tail::Torn {
+                        valid_len: sc.offset,
+                        extra_bytes: extra,
+                    },
+                    Some(record_len) => Tail::Damaged {
+                        valid_len: sc.offset,
+                        extra_bytes: extra,
+                        record_len,
+                    },
                 });
                 Ok(None)
             }
@@ -787,14 +961,16 @@ impl WalReader {
     }
 }
 
-/// Read and verify the whole log without modifying it. A torn tail is
-/// reported in [`VerifyReport::torn_bytes`]; mid-file corruption is an error.
+/// Read and verify the whole log without modifying it. A torn or damaged tail
+/// is reported in [`VerifyReport::torn_bytes`] and
+/// [`VerifyReport::damaged_tail`]; mid-file corruption is an error.
 pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, WalError> {
     let mut r = WalReader::open(path)?;
     while r.next()?.is_some() {}
-    let torn_bytes = match r.tail() {
-        Some(Tail::Torn { extra_bytes, .. }) => extra_bytes,
-        _ => 0,
+    let (torn_bytes, damaged_tail) = match r.tail() {
+        Some(Tail::Torn { extra_bytes, .. }) => (extra_bytes, false),
+        Some(Tail::Damaged { extra_bytes, .. }) => (extra_bytes, true),
+        _ => (0, false),
     };
     let records = r.records();
     Ok(VerifyReport {
@@ -803,6 +979,7 @@ pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, WalError> {
         chain_head: r.chain_head(),
         file_len: r.file_len(),
         torn_bytes,
+        damaged_tail,
     })
 }
 
@@ -810,7 +987,9 @@ impl From<WalError> for PortError {
     fn from(e: WalError) -> PortError {
         let kind = match &e {
             WalError::Io(_) => PortErrorKind::Io,
-            WalError::BadHeader | WalError::Corrupt { .. } => PortErrorKind::Corrupt,
+            WalError::BadHeader | WalError::Corrupt { .. } | WalError::DamagedTail { .. } => {
+                PortErrorKind::Corrupt
+            }
             WalError::SeqMismatch { .. } | WalError::RecordTooLarge => PortErrorKind::Invalid,
             WalError::Full => PortErrorKind::Full,
         };
@@ -849,17 +1028,26 @@ fn replay_file(
 pub struct FileEventLog {
     wal: Wal,
     repaired: u64,
+    sidecar: Option<PathBuf>,
 }
 
 impl FileEventLog {
-    /// Open or create the log at `path`; a torn tail is truncated away and
-    /// reported through [`EventLog::repaired_bytes`].
+    /// Open or create the log at `path`; a torn tail is saved to a sidecar
+    /// file, truncated away and reported through [`EventLog::repaired_bytes`].
+    /// A complete but damaged final record is refused with
+    /// [`WalError::DamagedTail`] unless `cfg.repair_damaged_tail` is set.
     pub fn open(path: impl AsRef<Path>, cfg: WalConfig) -> Result<FileEventLog, WalError> {
         let (wal, report) = Wal::open(path, cfg)?;
         Ok(FileEventLog {
             wal,
             repaired: report.truncated_bytes,
+            sidecar: report.sidecar,
         })
+    }
+
+    /// Sidecar file holding the bytes dropped when the log was opened, if any.
+    pub fn sidecar(&self) -> Option<&Path> {
+        self.sidecar.as_deref()
     }
 
     /// The underlying writer (for its counters and file length).
@@ -1051,6 +1239,7 @@ mod tests {
         WalConfig {
             fsync,
             max_file_bytes: 1 << 30,
+            ..WalConfig::default()
         }
     }
 
@@ -1235,6 +1424,19 @@ mod tests {
             if cut >= HEADER_LEN as usize {
                 assert_eq!(std::fs::read(&work).unwrap(), &bytes[..boundary as usize]);
             }
+            // The dropped bytes were saved first, exactly, next to the log.
+            if cut >= HEADER_LEN as usize && cut as u64 > boundary {
+                let side = rep.sidecar.clone().expect("sidecar");
+                assert_eq!(side, sidecar_path(&work, boundary), "cut {cut}");
+                assert_eq!(
+                    std::fs::read(&side).unwrap(),
+                    &bytes[boundary as usize..cut],
+                    "cut {cut}"
+                );
+                std::fs::remove_file(side).unwrap();
+            } else {
+                assert_eq!(rep.sidecar, None, "cut {cut}");
+            }
             // Appending continues with a valid chain.
             wal.append(complete as u64, &evs[complete]).unwrap();
             drop(wal);
@@ -1248,30 +1450,171 @@ mod tests {
         }
     }
 
+    /// Path of the first sidecar name for a tail dropped at `offset`.
+    fn sidecar_path(log: &Path, offset: u64) -> PathBuf {
+        let mut name = log.file_name().unwrap().to_os_string();
+        name.push(format!(".torn-{offset}"));
+        log.with_file_name(name)
+    }
+
+    fn repair_cfg() -> WalConfig {
+        WalConfig {
+            repair_damaged_tail: true,
+            ..cfg(FsyncPolicy::Never)
+        }
+    }
+
     #[test]
-    fn every_single_byte_flip_in_last_record_is_a_torn_tail() {
+    fn every_single_byte_flip_in_last_record_is_damaged_or_torn_and_never_lost() {
         let dir = TempDir::new("wal-flip-last");
         let src = dir.join("src.wal");
         let (bytes, bounds) = build_log(&src, 30);
         let last_start = bounds[bounds.len() - 2] as usize;
+        let record = bytes.len() - last_start;
         let work = dir.join("work.wal");
+        let (mut damaged, mut torn) = (0, 0);
         for mask in [0xFFu8, 0x01, 0x80] {
             for i in last_start..bytes.len() {
                 let mut b = bytes.clone();
                 b[i] ^= mask;
                 std::fs::write(&work, &b).unwrap();
+                // The record stays complete when its (possibly flipped) length
+                // field is a valid length that fits in the file.
+                let len =
+                    u32::from_le_bytes(b[last_start..last_start + 4].try_into().unwrap()) as usize;
+                let complete = (MIN_PAYLOAD..=MAX_RECORD_BYTES).contains(&len)
+                    && LEN_FIELD + len + CHAIN_LEN <= record;
+                let at = format!("byte {i} mask {mask:#x}");
                 // Read-only view first: reported, not repaired.
                 let v = verify(&work).unwrap();
-                assert_eq!(v.records, 29, "byte {i} mask {mask:#x}");
-                assert_eq!(v.torn_bytes, (bytes.len() - last_start) as u64);
-                assert_eq!(std::fs::read(&work).unwrap(), b);
-                let (wal, rep) = Wal::open(&work, cfg(FsyncPolicy::Never)).unwrap();
-                assert_eq!(rep.records, 29, "byte {i} mask {mask:#x}");
-                assert_eq!(rep.truncated_bytes, (bytes.len() - last_start) as u64);
-                assert_eq!(wal.len(), last_start as u64);
-                assert_eq!(std::fs::read(&work).unwrap(), &bytes[..last_start]);
+                assert_eq!(v.records, 29, "{at}");
+                assert_eq!(v.torn_bytes, record as u64, "{at}");
+                assert_eq!(v.damaged_tail, complete, "{at}");
+                assert_eq!(std::fs::read(&work).unwrap(), b, "{at}");
+                let r = ReadOnlyFileLog::open(&work).unwrap();
+                assert_eq!(r.report().damaged_tail, complete, "{at}");
+                assert_eq!(std::fs::read(&work).unwrap(), b, "{at}");
+
+                if complete {
+                    damaged += 1;
+                    // A complete but damaged record is refused and untouched.
+                    match Wal::open(&work, cfg(FsyncPolicy::Never)) {
+                        Err(WalError::DamagedTail { offset, record_len }) => {
+                            assert_eq!(offset, last_start as u64, "{at}");
+                            assert_eq!(record_len, (LEN_FIELD + len + CHAIN_LEN) as u64, "{at}");
+                        }
+                        other => panic!("{at}: {:?}", other.map(|_| ())),
+                    }
+                    assert_eq!(std::fs::read(&work).unwrap(), b, "{at}");
+                    assert!(!sidecar_path(&work, last_start as u64).exists(), "{at}");
+                    // The explicit repair option saves the bytes, then truncates.
+                    let (wal, rep) = Wal::open(&work, repair_cfg()).unwrap();
+                    assert_eq!(rep.records, 29, "{at}");
+                    assert_eq!(rep.truncated_bytes, record as u64, "{at}");
+                    assert_eq!(wal.len(), last_start as u64, "{at}");
+                    let side = rep.sidecar.unwrap();
+                    assert_eq!(std::fs::read(&side).unwrap(), &b[last_start..], "{at}");
+                    std::fs::remove_file(side).unwrap();
+                } else {
+                    torn += 1;
+                    // An incomplete record is repaired automatically, after
+                    // saving it.
+                    let (wal, rep) = Wal::open(&work, cfg(FsyncPolicy::Never)).unwrap();
+                    assert_eq!(rep.records, 29, "{at}");
+                    assert_eq!(rep.truncated_bytes, record as u64, "{at}");
+                    assert_eq!(wal.len(), last_start as u64, "{at}");
+                    let side = rep.sidecar.unwrap();
+                    assert_eq!(std::fs::read(&side).unwrap(), &b[last_start..], "{at}");
+                    std::fs::remove_file(side).unwrap();
+                }
+                assert_eq!(std::fs::read(&work).unwrap(), &bytes[..last_start], "{at}");
             }
         }
+        assert!(damaged > 0 && torn > 0, "both outcomes are exercised");
+    }
+
+    #[test]
+    fn damaged_tail_error_explains_the_repair_option_and_maps_to_corrupt() {
+        let e = WalError::DamagedTail {
+            offset: 77,
+            record_len: 50,
+        };
+        let text = e.to_string();
+        assert!(text.contains("77") && text.contains("repair"), "{text}");
+        let p = PortError::from(e);
+        assert_eq!(p.kind, PortErrorKind::Corrupt);
+        assert!(!WalConfig::default().repair_damaged_tail);
+    }
+
+    #[test]
+    fn file_event_log_refuses_a_damaged_tail_and_repairs_it_on_request() {
+        let dir = TempDir::new("wal-fel-damaged");
+        let p = dir.join("a.wal");
+        let (mut bytes, bounds) = build_log(&p, 6);
+        bytes[bounds[5] as usize + 9] ^= 0x20;
+        std::fs::write(&p, &bytes).unwrap();
+        let err = FileEventLog::open(&p, cfg(FsyncPolicy::Never)).unwrap_err();
+        assert!(matches!(err, WalError::DamagedTail { .. }));
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        let mut log = FileEventLog::open(&p, repair_cfg()).unwrap();
+        assert_eq!(log.len(), 5);
+        assert_eq!(log.repaired_bytes(), bounds[6] - bounds[5]);
+        assert_eq!(
+            std::fs::read(log.sidecar().unwrap()).unwrap(),
+            &bytes[bounds[5] as usize..]
+        );
+        log.append(5, &sample_events(6)[5]).unwrap();
+        assert_eq!(log.head(), verify(&p).unwrap().chain_head);
+    }
+
+    #[test]
+    fn sidecars_never_overwrite_and_get_numeric_suffixes() {
+        let dir = TempDir::new("wal-sidecar-names");
+        let p = dir.join("a.wal");
+        let (bytes, bounds) = build_log(&p, 4);
+        let start = bounds[3];
+        let torn = bytes[..bytes.len() - 5].to_vec();
+        // An unrelated file already owns the plain name.
+        let first = sidecar_path(&p, start);
+        std::fs::write(&first, b"precious").unwrap();
+        std::fs::write(&p, &torn).unwrap();
+        let (_, rep) = Wal::open(&p, cfg(FsyncPolicy::Never)).unwrap();
+        let second = rep.sidecar.unwrap();
+        assert_eq!(
+            second.file_name().unwrap().to_str().unwrap(),
+            format!("a.wal.torn-{start}.1")
+        );
+        assert_eq!(second.parent(), p.parent());
+        assert_eq!(std::fs::read(&first).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&second).unwrap(), &torn[start as usize..]);
+        // The same damage again takes the next free name.
+        std::fs::write(&p, &torn).unwrap();
+        let (_, rep) = Wal::open(&p, cfg(FsyncPolicy::Never)).unwrap();
+        assert_eq!(
+            rep.sidecar.unwrap().file_name().unwrap().to_str().unwrap(),
+            format!("a.wal.torn-{start}.2")
+        );
+    }
+
+    #[test]
+    fn when_the_sidecar_cannot_be_created_the_log_is_left_untouched() {
+        let dir = TempDir::new("wal-sidecar-exhausted");
+        let p = dir.join("a.wal");
+        let (bytes, bounds) = build_log(&p, 3);
+        let torn = bytes[..bytes.len() - 5].to_vec();
+        std::fs::write(&p, &torn).unwrap();
+        let start = bounds[2];
+        std::fs::write(sidecar_path(&p, start), b"x").unwrap();
+        for n in 1..=MAX_SIDECAR_SUFFIX {
+            let mut name = sidecar_path(&p, start).into_os_string();
+            name.push(format!(".{n}"));
+            std::fs::write(name, b"x").unwrap();
+        }
+        assert!(matches!(
+            Wal::open(&p, cfg(FsyncPolicy::Never)),
+            Err(WalError::Io(_))
+        ));
+        assert_eq!(std::fs::read(&p).unwrap(), torn);
     }
 
     #[test]
@@ -1315,6 +1658,15 @@ mod tests {
             let (wal, rep) = Wal::open(&work, cfg(FsyncPolicy::Never)).unwrap();
             assert_eq!(rep.records, 10);
             assert_eq!(rep.truncated_bytes, zeros as u64);
+            // A zero tail up to one maximum record is saved; a longer one holds
+            // nothing worth keeping.
+            if zeros as u64 <= MAX_TORN_TAIL {
+                let side = rep.sidecar.clone().unwrap();
+                assert_eq!(std::fs::read(&side).unwrap(), vec![0u8; zeros]);
+                std::fs::remove_file(side).unwrap();
+            } else {
+                assert_eq!(rep.sidecar, None);
+            }
             assert_eq!(wal.len(), bytes.len() as u64);
             assert_eq!(std::fs::read(&work).unwrap(), bytes);
         }
@@ -1660,6 +2012,7 @@ mod tests {
             WalConfig {
                 fsync: FsyncPolicy::Never,
                 max_file_bytes: limit,
+                ..WalConfig::default()
             },
         )
         .unwrap();
@@ -1684,6 +2037,7 @@ mod tests {
             WalConfig {
                 fsync: FsyncPolicy::Never,
                 max_file_bytes: 10,
+                ..WalConfig::default()
             },
         )
         .unwrap();
@@ -1719,6 +2073,39 @@ mod tests {
         assert_eq!(v.records, 11);
         assert_eq!(v.last_seq, Some(10));
         assert_eq!(v.torn_bytes, bounds[12] - bounds[11] - 7);
+    }
+
+    #[test]
+    fn reader_and_verify_report_a_damaged_tail_without_touching_it() {
+        let dir = TempDir::new("wal-reader-damaged");
+        let src = dir.join("src.wal");
+        let (bytes, bounds) = build_log(&src, 8);
+        let work = dir.join("work.wal");
+        let mut b = bytes.clone();
+        b[bounds[7] as usize + 12] ^= 0x04;
+        std::fs::write(&work, &b).unwrap();
+        let mut r = WalReader::open(&work).unwrap();
+        while r.next().unwrap().is_some() {}
+        assert_eq!(
+            r.tail(),
+            Some(Tail::Damaged {
+                valid_len: bounds[7],
+                extra_bytes: bounds[8] - bounds[7],
+                record_len: bounds[8] - bounds[7],
+            })
+        );
+        let v = verify(&work).unwrap();
+        assert!(v.damaged_tail);
+        assert_eq!(v.torn_bytes, bounds[8] - bounds[7]);
+        let mut log = ReadOnlyFileLog::open(&work).unwrap();
+        assert_eq!(log.len(), 7);
+        assert_eq!(log.repaired_bytes(), bounds[8] - bounds[7]);
+        log.replay_from(0, &mut |_, _| {}).unwrap();
+        assert_eq!(std::fs::read(&work).unwrap(), b, "file untouched");
+        // A clean or merely torn log is not reported as damaged.
+        assert!(!verify(&src).unwrap().damaged_tail);
+        std::fs::write(&work, &bytes[..bytes.len() - 2]).unwrap();
+        assert!(!verify(&work).unwrap().damaged_tail);
     }
 
     #[test]
@@ -1933,6 +2320,13 @@ mod tests {
         );
         assert_eq!(kind(WalError::RecordTooLarge), PortErrorKind::Invalid);
         assert_eq!(kind(WalError::Full), PortErrorKind::Full);
+        assert_eq!(
+            kind(WalError::DamagedTail {
+                offset: 1,
+                record_len: 2
+            }),
+            PortErrorKind::Corrupt
+        );
         let p = PortError::from(WalError::Corrupt {
             offset: 9,
             why: "chain mismatch",
