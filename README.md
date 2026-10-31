@@ -19,6 +19,7 @@ fund and auto-deleveraging, and a crash-safe event log with exact replay.
 |----------|--------------|
 | Fixed-point price, size and money types, checked arithmetic, documented rounding | Floating point (deliberately absent), multiple collateral assets |
 | Order book with price-time priority, limit GTC/IOC/FOK/post-only, market orders with a slippage limit, reduce-only, cancel, cancel-replace, self-trade prevention, tick/lot/min-notional | Iceberg, stop and trigger orders, order modification of side/market, batch auctions |
+| Price band around the mark (limit prices, market-order slippage, resting orders swept when the mark moves) and execution-price loss in the margin test | Circuit breakers, auctions, price protection against a malicious oracle |
 | Cross-margin accounts, tiered margin schedule, max leverage, maker/taker fees with rebates, deposits and margin-checked withdrawals | Isolated margin, portfolio margin, sub-accounts, fee tiers driven by volume |
 | Oracle events with staleness checks and a bounded change filter, mark price, premium-based funding with a clamp and an exact zero-sum split | Oracle security, multiple sources, TWAP windows |
 | Liquidation by IOC orders at a documented price rule, insurance fund, simple deterministic auto-deleveraging, bad-debt reporting | Liquidation auctions, partial fills by external liquidators, real ADL ranking by leverage |
@@ -126,6 +127,8 @@ perp-engine book <wal> [--market N] [--depth N]
 perp-engine positions <wal> [--account N]
 perp-engine serve --dir DIR [--listen ADDR] [--token-env NAME | --token-file PATH]
                   [--allow-non-loopback] [--init] [--markets N]
+                  [--fsync always|every:N|never] [--snapshot-every N]
+                  [--max-log-mib N] [--repair]
 perp-engine gen-token [--out FILE]
 ```
 
@@ -141,38 +144,45 @@ followed by `verify /tmp/simdir/engine.wal --strict` (release build, container):
 log: /tmp/simdir/engine.wal
 simulation: seed 1 accounts 200 markets 1 events 200000
 bootstrap events      270
-generated events      200000 (accepted 182887, rejected 17113)
-rejections            fok_not_fillable=7557 invalid_price=362 margin_breach=1397 no_liquidity=6364 unknown_account=401 unknown_order=408 would_cross=273 zero_qty=351
-orders rested         54760
-fills                 82655
-self-trade cancels    71
+generated events      200000 (accepted 183111, rejected 16889)
+rejections            fok_not_fillable=7531 invalid_price=364 margin_breach=6295 no_liquidity=1395 unknown_account=423 unknown_order=388 would_cross=125 zero_qty=368
+orders rested         49843
+fills                 65247
+self-trade cancels    64
 funding settlements   68
-liquidation steps     139
+liquidation steps     622
 auto-deleveraging     0
-insurance fund        49868.581637
-fee pool              35929.708882
+insurance fund        45707.883001
+fee pool              58647.470215
 bad debt              0.000000
-checkpoint     50000 events: resting orders      2, accounts with positions  196, rss 2464 KiB
-checkpoint    100000 events: resting orders      1, accounts with positions  195, rss 2464 KiB
-checkpoint    150000 events: resting orders      2, accounts with positions  195, rss 2464 KiB
-checkpoint    200000 events: resting orders      4, accounts with positions  195, rss 2464 KiB
-state hash            2712050a4d128c4a5b438177616cda0cb0a9ab9b5e5df75f349e0d616e68fd0f
+checkpoint     50000 events: resting orders     22, accounts with positions  196, rss 2464 KiB
+checkpoint    100000 events: resting orders     37, accounts with positions  197, rss 2464 KiB
+checkpoint    150000 events: resting orders     26, accounts with positions  192, rss 2464 KiB
+checkpoint    200000 events: resting orders     29, accounts with positions  186, rss 2464 KiB
+state hash            c1c3400fa37f1e084b79a1e72d128638d79bb65db5614d2d9281cab12af092c7
 
-records               200270
-file length           18076731 bytes
-chain head            4cb0fb1a69a2f0e0174946cd8f41026cdbd6a2acd08e818491c50735059ce4e3
+records               199091
+file length           17914553 bytes
+chain head            a77724d75bb4e3252accdf402b7e5abc0cef016fe52dda2b610155dd338dcffc
 torn tail             0 bytes
-state hash            2712050a4d128c4a5b438177616cda0cb0a9ab9b5e5df75f349e0d616e68fd0f
+damaged tail          no
+state hash            c1c3400fa37f1e084b79a1e72d128638d79bb65db5614d2d9281cab12af092c7
 OK: chain valid, replay deterministic, invariants hold
 ```
 
 The state hash printed by `simulate` equals the one `verify` recomputes from the
-file by replay. 17 113 of the 200 000 generated events (8.6%) are rejected: the
+file by replay. 16 889 of the 200 000 generated events (8.4%) are rejected: the
 generator deliberately emits about 0.8% invalid events (zero quantity, off-tick
 prices, unknown accounts and orders), and the rest are margin, liquidity and
-fill-or-kill outcomes. Auto-deleveraging does not occur in this flow because the
-insurance fund always covers the deficits; the liquidation tests build the cases
-that exhaust the fund.
+fill-or-kill outcomes. The log holds 199 091 records, not 200 270: 1 179 events
+(unknown account, unknown order, zero quantity) are refused by `Engine::precheck`
+before they are logged. Margin rejections are frequent (6 295) because the margin
+test now reserves the execution-price loss of each order (ADR 10).
+
+In this flow the insurance fund started at 50 000 and ended at 45 707.88 after
+paying 59 realised shortfalls of liquidated whales (about 5 195 in total) and
+receiving liquidation fees; bad debt is zero and auto-deleveraging does not
+occur. The liquidation tests build the cases that exhaust the fund.
 
 ## Money conservation, by test
 
@@ -194,11 +204,13 @@ the money that came in. Positions carry a *money* cost basis, so each trade move
 |----------|---------------------|
 | Money identity holds after random flow (300k+ events, three seeds, checked every 500 events) | `properties.rs::invariants_hold_over_300k_events_across_seeds`, `money_in_equals_money_out_plus_fees_and_insurance` |
 | Money identity after scenarios: fees, rebates, flips through zero, withdrawals | `accounts_margin.rs` (`assert_conserved`), `order_matching.rs` |
-| Money identity through liquidation, insurance payout, ADL, bad debt | `liquidation.rs` (`identity`) |
+| Money identity through liquidation, insurance payout and ADL (`bad_debt` stays 0 in every scenario the public API can build; a non-zero `bad_debt` is accepted by snapshot decode and covered there) | `liquidation.rs` (`identity`), `liquidation_fairness.rs` |
 | Funding is zero-sum, remainder carried explicitly | `oracle_funding.rs::funding_is_zero_sum_with_several_accounts_and_odd_amounts`, `engine::funding` unit tests |
 | Order book never crossed | `properties.rs` (every event), `order_matching.rs::book_is_never_crossed_under_a_deterministic_mixed_sequence` |
 | Position sizes sum to zero per market | `properties.rs::position_sizes_sum_to_zero_in_every_market`, enforced on decode |
 | No underwater account without liquidation having run | `properties.rs` (`underwater_accounts` vs `LiquidationStarted`), `liquidation.rs` |
+| No fill executes outside the price band of the mark in force (non-liquidation fills) | `price_band.rs` (seeded flow), `review_regressions.rs` (colluding-accounts attack at 10x, 3x, 2x, 1.2x, 1.05x and the mirror cases) |
+| The insurance fund never drops while accounts trade off-mark (4 seeded fuzz runs of 20 000 events) and never pays unrealised losses: after an `InsurancePaid` the collateral is exactly 0 | `review_regressions.rs`, `liquidation.rs`, `liquidation_fairness.rs` |
 | Replay of the log gives the identical state hash | `properties.rs::replay_of_the_log_reproduces_the_state_hash`, `perp-infra/tests/wal_recovery.rs` |
 | Snapshot + tail equals full replay | `properties.rs::snapshot_plus_tail_equals_full_replay`, `wal_recovery.rs::snapshot_recovery_equals_full_replay` |
 | Rejected events change nothing but the counter | `properties.rs::rejected_events_change_only_the_counter` |
@@ -208,16 +220,21 @@ the money that came in. Positions carry a *money* cost basis, so each trade move
 
 ## Tests by layer
 
-687 tests, all deterministic, no network beyond loopback, all in temp dirs.
+834 tests, all deterministic, no network beyond loopback, all in temp dirs (counts from
+`cargo test --workspace` in a fresh container; `scripts/run-layers.sh` runs them per layer).
 
 | Layer | Kind | Tests |
 |-------|------|-------|
-| Domain (`perp-domain`) | unit tests of values, book, margin, codec, hashing | 75 |
-| | aggregate scenarios: matching (82), accounts and margin (42), oracle and funding (38), liquidation and insurance (44) | 206 |
-| | state codec and hash (35), adversarial and fuzz (43), property tests (7), smoke (1) | 86 |
-| Application (`perp-app`) | use cases on in-memory fakes (service, recovery, simulation) and the port contract suites against the fakes | 60 |
-| Adapters (`perp-infra`) | unit tests (JSON, protocol, token, WAL, snapshot, clock, probe), contract suites against the real file adapters, TCP server tests (48), WAL recovery (23) | 232 |
-| CLI (`perp-cli`) | argument and rendering units (8), architecture (6), end-to-end on the real binary (12), memory (2) | 28 |
+| Domain (`perp-domain`) | unit tests of values, book, margin, codec, hashing, errors | 76 |
+| | aggregate scenarios: matching (82), accounts and margin (42), oracle and funding (38), liquidation and insurance (45), liquidation fairness (16), price band (45), precheck (28) | 296 |
+| | state codec and hash (35), adversarial and fuzz (43), property tests (7), review regressions (28), smoke (1) | 114 |
+| Application (`perp-app`) | use cases on in-memory fakes (service, recovery, read-only mode, clock steps, simulation) and the port contract suites against the fakes | 69 |
+| Adapters (`perp-infra`) | unit tests (JSON, protocol, token, WAL, snapshot, clock, probe) 168, TCP server 49, WAL recovery 26 | 243 |
+| CLI (`perp-cli`) | argument and rendering units (10), architecture (6), end-to-end on the real binary (13), WAL repair (5), memory (2) | 36 |
+
+`review_regressions.rs` holds the tests written first for the findings of an
+independent security review (see [SECURITY.md](SECURITY.md)); 22 of its 28 tests
+failed on the engine as it was before the fixes, the other 6 are controls.
 
 Domain tests exercise the aggregate through its public API: every rule has a
 passing and a rejecting case with an exact `Error` asserted, and every domain
@@ -240,11 +257,11 @@ and `benches/` are never counted.
 
 ```text
 layer               lines  covered  percent
-domain               3632     3554   97.85%
-application           652      636   97.55%
-infrastructure       2362     2250   95.26%
-cli                   481      450   93.56%
-all                  7127     6890   96.67%
+domain               3866     3791   98.06%
+application           707      693   98.02%
+infrastructure       2472     2350   95.06%
+cli                   524      488   93.13%
+all                  7569     7322   96.74%
 ```
 
 Targets were 95% (domain), 90% (application), 85% (overall). What is **not**
@@ -267,30 +284,34 @@ invariant and property tests carry the weight.
 ## Benchmarks
 
 `cargo bench --bench throughput` (std only, `Instant`; no criterion). It records a
-seeded event stream once (400 270 events: 200 accounts, one market, 348 498 order
+seeded event stream once (400 270 events: 200 accounts, one market, 342 035 order
 placements) and replays it for each measurement, so every variant does identical
 work. Latency is the time around one `Engine::apply` call (the `Instant` pair
-itself costs tens of nanoseconds).
+itself costs tens of nanoseconds). Every recorded event, including the
+deliberately invalid ones, goes straight to `Engine::apply`; `Engine::precheck` and
+the service layer are not part of the "engine only" rows.
 
 Host: a Linux aarch64 container (Docker on an Apple-silicon Mac, 12 vCPUs, 24 GB
-RAM visible), release build with `overflow-checks = true`, single thread. **The
-machine was shared with other builds while I measured (load average about 17), so
-the three runs differ a lot.** Best run and range over three consecutive runs:
+RAM visible), release build with `overflow-checks = true`, single thread, machine
+mostly idle (load average 8 at the start of the runs; an earlier set of runs on a
+loaded machine was 3x slower and much noisier, which is why numbers from a busy
+host are not reported here). Three consecutive runs:
 
-| Measurement | Best run | Range over 3 runs |
-|-------------|----------|-------------------|
-| engine only, events/s | 749 912 | 245 683 - 749 912 |
-| engine only, order placements/s | 652 917 | 213 906 - 652 917 |
-| `apply` latency, order placements p50 / p99 / p99.9 | 250 ns / 3.4 us / 8.8 us | p50 250-417 ns, p99 3.4-6.2 us |
-| `apply` latency, other events p50 / p99 | 167 ns / 29.8 us | p99 29.8-132 us (oracle/tick events scan holders) |
-| engine + file WAL, fsync never, events/s | 350 236 | 84 746 - 350 236 |
-| engine + file WAL, fsync every 1000, events/s | 220 044 | 14 579 - 220 044 |
-| engine + file WAL, fsync always, events/s (3000 events) | 415 | 134 - 415 |
+| Measurement | Run 1 | Run 2 | Run 3 |
+|-------------|-------|-------|-------|
+| engine only, events/s | 974 722 | 941 891 | 951 706 |
+| engine only, order placements/s | 832 910 | 804 856 | 813 243 |
+| `apply` latency, order placements p50 / p99 / p99.9 | 250 ns / 3.1 us / 6.8 us | 250 ns / 3.2 us / 7.2 us | 250 ns / 3.3 us / 7.7 us |
+| `apply` latency, other events p50 / p99 / p99.9 | 167 ns / 18.9 us / 49 us | 167 ns / 19.6 us / 49 us | 167 ns / 21.4 us / 51.5 us |
+| engine + file WAL, fsync never, events/s | 511 119 | 521 397 | 481 871 |
+| engine + file WAL, fsync every 1000, events/s | 322 606 | 377 017 | 362 990 |
+| engine + file WAL, fsync always, events/s (3000 events) | 1 355 | 1 863 | 2 239 |
 
-Caveats: synthetic flow with few resting orders (books are shallow), one machine,
-a Linux VM on macOS (so `fsync` timing reflects the VM's virtual disk, not
-hardware), no warm-up beyond the recorded pass, tails dominated by scheduler noise
-in the loaded runs. Treat these as order-of-magnitude figures, not a claim of
+Oracle and tick events are the slow "other events" (they scan all holders and
+settle funding). Max latencies (48 us to 447 us) are scheduler noise on a shared VM.
+Caveats: synthetic flow with shallow books, one machine, a Linux VM on macOS (so
+`fsync` timing reflects the VM's virtual disk, not hardware), no warm-up beyond the
+recorded pass. Treat these as order-of-magnitude figures, not a claim of
 production capacity.
 
 ## Bounded memory
@@ -304,11 +325,11 @@ the assertion allows a band of 8 MiB or 10%; the observed movement is far smalle
 Release build, container, one run with 3 000 000 events (`PERP_MEMORY_EVENTS=3000000`):
 
 ```text
-after    300000 events: rss    2464 KiB, resting orders 11
-after    600000 events: rss    2464 KiB, resting orders 36
-after    900000 events: rss    2464 KiB, resting orders 10
-...                                (identical through 2 700 000)
-after   3000000 events: rss    2464 KiB, resting orders 15
+after    300000 events: rss    2592 KiB, resting orders 40
+after    600000 events: rss    2720 KiB, resting orders 25
+after    900000 events: rss    2720 KiB, resting orders 22
+...                                (2720 KiB through 2 700 000)
+after   3000000 events: rss    2720 KiB, resting orders 25
 ```
 
 Because that flow keeps the books shallow, a second test fills every book to its
@@ -316,9 +337,9 @@ limit (200 accounts x 64 orders = 12 800 resting orders that never trade), then
 cancels and re-places them for 14 rounds:
 
 ```text
-round  0: resting orders  12800, rss    5024 KiB
-round  1: resting orders  12800, rss    5152 KiB
-round  2..13: resting orders  12800, rss    5152 KiB
+round  0: resting orders  12800, rss    5280 KiB
+round  1: resting orders  12800, rss    5408 KiB
+round  2..13: resting orders  12800, rss    5408 KiB
 ```
 
 Memory grows while the books fill and then stays flat.
@@ -360,7 +381,14 @@ line, integers in raw units (price 1e-6, quantity 1e-4, money 1e-6), first messa
   bucket (200/s, burst 400) with disconnect on sustained abuse, auth deadline (5 s),
   idle timeout (60 s), three auth failures with a delay each, write timeout. One
   request in flight per connection and a bounded queue to a single backend thread
-  give backpressure all the way to the client's TCP window.
+  give backpressure all the way to the client's TCP window. Connection slots are
+  reserved with an atomic compare-and-swap, so connection churn cannot leak slots.
+* **Log full is not fatal.** When the log reaches `--max-log-mib` (default 1024) the
+  service becomes read-only: queries still work and state-changing requests get
+  `{"ok":false,"error":"read_only"}`. Free space or raise the limit and restart.
+  Requests that `Engine::precheck` can refuse from a look-up alone (unknown
+  account, order or market, zero amount, ...) are rejected before they are logged,
+  so junk requests do not grow the log. Any other storage error stops the server.
 
 Threat model for this mode (also in [SECURITY.md](SECURITY.md)):
 
@@ -368,7 +396,7 @@ Threat model for this mode (also in [SECURITY.md](SECURITY.md)):
 |--------|---------|-------------|
 | Unauthenticated client | token required before any other request; failures delayed and limited | no per-IP limits |
 | Oversized or malformed input | bounded line reads, strict bounded JSON, errors without echoing input | |
-| Flooding and slow clients | rate limit, connection cap, timeouts, bounded queue | many token-holding clients can still saturate the single engine thread |
+| Flooding and slow clients | rate limit, connection cap (atomic slot reservation), timeouts, bounded queue; junk requests are not logged | many token-holding clients can still saturate the single engine thread; valid-looking requests that fail later (for example a margin rejection) are logged and consume log space until `--max-log-mib` is reached, after which the service is read-only |
 | Eavesdropping and tampering | none | no TLS: the token and all traffic are plaintext on the wire |
 | A token holder acting maliciously | none | one shared token with full rights: any account, any oracle price |
 | Token theft from the host | file mode 0600, environment not logged | anyone who can read the process environment or memory |
@@ -381,10 +409,29 @@ Threat model for this mode (also in [SECURITY.md](SECURITY.md)):
 * **No oracle security.** Prices are whatever the sequencer or a token holder sends;
   the staleness check and the bounded change filter limit blast radius, not trust.
 * **Simplified liquidation and ADL.** Fixed chunk size and band; ADL ranking is only
-  profit ratio, size and account id; liquidation is skipped while an oracle is stale
-  and a stuck account (empty book) waits for liquidity or the next oracle/tick.
-  Orders only reduce risk through a worst-case exposure rule; the reduce-only quantity
-  is clamped, not rejected.
+  profit ratio, size and account id. The liquidation queue is served round-robin,
+  so an account can wait up to `ceil(pending / max_liquidations_per_event)` events
+  behind accounts that cannot be filled; a stuck account (nobody quotes the other
+  side) waits for liquidity or the next oracle/tick. Positions in a market whose
+  oracle is stale are ignored when judging the rest of the account, and nothing is
+  paid from the fund while one remains. Orders only reduce risk through a
+  worst-case exposure rule; the reduce-only quantity is clamped, not rejected.
+* **Price band and gap risk.** No fill (other than liquidation/ADL) executes
+  further from the mark than `price_band_bps` (default 2.5%), but one oracle update
+  may move the mark by up to 5% (the default change filter), more than an account's
+  margin. That gap loss is covered by the insurance fund and then by ADL; it can
+  exhaust them. After a large move, resting orders now more aggressive than the
+  band are cancelled, which also removes liquidity that liquidations would need.
+  A malicious oracle source is out of scope.
+* **Log repair.** An incomplete tail is repaired automatically after its bytes are
+  saved to a `.torn-<offset>` sidecar. A complete-but-damaged final record is not
+  removed without `serve --repair`. A damaged length field in the last record
+  looks like a torn write and is repaired (with the sidecar). The log is not
+  authenticated: whoever can write the file can rebuild the hash chain.
+* **Time.** The service never advances event time by more than one hour
+  (`max_time_step_ms`) per event; after a longer downtime it catches up one step per
+  event, and oracle updates stamped with the real time are rejected as coming from
+  the future until it has.
 * **Bad debt can exist.** If the insurance fund and ADL cannot cover a loss, the
   amount is recorded in `bad_debt` and the identity still holds, but the venue is
   then insolvent by that amount.
