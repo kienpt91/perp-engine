@@ -19,3 +19,4 @@ pub mod token;
 pub mod protocol;
 pub mod server;
 pub mod wal;
+pub mod snapshot;
