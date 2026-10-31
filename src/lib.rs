@@ -10,3 +10,4 @@
 pub mod error;
 pub mod fixed;
 pub mod sha256;
+pub mod codec;
