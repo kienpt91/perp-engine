@@ -25,3 +25,4 @@ pub mod api;
 pub mod ports;
 pub mod fakes;
 pub mod contract;
+pub mod service;
