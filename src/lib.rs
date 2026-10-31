@@ -9,3 +9,4 @@
 #![warn(missing_docs)]
 pub mod error;
 pub mod fixed;
+pub mod sha256;
