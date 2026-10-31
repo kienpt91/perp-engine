@@ -20,6 +20,7 @@
 pub mod account;
 pub mod book;
 pub mod codec;
+pub mod engine;
 pub mod error;
 pub mod fixed;
 pub mod margin;

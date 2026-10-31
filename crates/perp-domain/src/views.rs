@@ -80,6 +80,8 @@ pub struct Summary {
     pub insurance_fund: Money,
     /// Fee pool balance (fees collected minus rebates paid).
     pub fee_pool: Money,
+    /// Losses no one could cover (non-zero means the venue is insolvent).
+    pub bad_debt: Money,
     /// Number of accounts with an open position.
     pub accounts_with_positions: u32,
     /// Liquidation steps executed so far.
