@@ -11,12 +11,13 @@
 set -eu
 
 target="${CARGO_TARGET_DIR:-target}/coverage"
+case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
 profraw="$target/profraw"
 rm -rf "$target"
 mkdir -p "$profraw"
 
 export RUSTFLAGS="-C instrument-coverage"
-export LLVM_PROFILE_FILE="$PWD/$profraw/%p-%m.profraw"
+export LLVM_PROFILE_FILE="$profraw/%p-%m.profraw"
 export CARGO_TARGET_DIR="$target/build"
 
 cargo test --locked --workspace -- --test-threads=4 >"$target/test.log" 2>&1 || {
