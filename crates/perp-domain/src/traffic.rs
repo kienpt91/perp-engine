@@ -173,8 +173,8 @@ impl TrafficGenerator {
     fn oracle_event(&mut self, engine: &Engine) -> EventBody {
         let market = self.pick_market();
         let cur = self.index_of(engine, market);
-        let bps = if self.rng.chance(1, 60) {
-            self.rng.range(150, 450) // rare jump
+        let bps = if self.rng.chance(1, 25) {
+            self.rng.range(200, 450) // jump
         } else {
             self.rng.range(0, 40)
         };
@@ -319,7 +319,7 @@ impl TrafficGenerator {
             };
         }
         let side = self.random_side();
-        let offset = self.rng.range(1, 30) * (idx / 20_000 / tick).max(1) * tick;
+        let offset = self.rng.range(1, 200) * (idx / 20_000 / tick).max(1) * tick;
         let price = match side {
             Side::Buy => Self::round_tick(idx.saturating_sub(offset), tick),
             Side::Sell => Self::round_tick(idx + offset, tick),
@@ -367,7 +367,7 @@ impl TrafficGenerator {
                 StpMode::CancelNewest,
             )
         } else {
-            let wiggle = idx / 500;
+            let wiggle = idx / 2_000;
             let price = match side {
                 Side::Buy => Self::round_tick(idx + wiggle, tick),
                 Side::Sell => Self::round_tick(idx.saturating_sub(wiggle), tick),
@@ -431,7 +431,7 @@ impl TrafficGenerator {
         let idx = self.index_of(engine, market);
         // size so that notional is roughly 15x the account's collateral
         let collateral = engine.collateral(account).map_or(0, |c| c.0.max(0));
-        let target = u128::try_from(collateral).unwrap_or(0) * 15;
+        let target = u128::try_from(collateral).unwrap_or(0) * 18;
         let qty_raw = target * 10_000 / u128::from(idx.max(1));
         let lots = u64::try_from(qty_raw / 10).unwrap_or(0).clamp(1, 20_000);
         let tick = engine.market_config(market).map_or(10_000, |c| c.tick);
