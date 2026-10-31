@@ -73,7 +73,7 @@ impl Engine {
         let due: Vec<MarketId> = self
             .markets
             .iter()
-            .filter(|(_, m)| ts >= m.next_funding_ts)
+            .filter(|(_, m)| m.next_funding_ts != u64::MAX && ts >= m.next_funding_ts)
             .map(|(id, _)| *id)
             .collect();
         for id in due {
@@ -85,10 +85,11 @@ impl Engine {
     fn settle_funding(&mut self, id: MarketId, ts: Millis, out: &mut Vec<Output>) -> Result<()> {
         let m = self.market_mut(id)?;
         let interval = m.cfg.funding_interval_ms;
+        // A boundary beyond u64::MAX saturates: such a market never settles again.
         m.next_funding_ts = (ts / interval)
             .checked_add(1)
             .and_then(|n| n.checked_mul(interval))
-            .ok_or(Error::Overflow)?;
+            .unwrap_or(u64::MAX);
         let mean = if m.premium_count > 0 {
             floor_div(m.premium_sum, i128::from(m.premium_count))?
         } else {
