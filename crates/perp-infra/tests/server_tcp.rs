@@ -1276,3 +1276,39 @@ fn binding_a_port_that_is_in_use_fails() {
     cfg.listen = first.local_addr().unwrap();
     assert!(Server::bind(cfg).is_err());
 }
+
+#[test]
+fn connection_churn_never_leaks_slots() {
+    let mut cfg = base_cfg();
+    cfg.max_connections = 4;
+    let r = start(cfg);
+    let addr = r.addr;
+    let connected = Arc::new(AtomicU64::new(0));
+    let hs: Vec<_> = (0..6)
+        .map(|_| {
+            let connected = Arc::clone(&connected);
+            thread::spawn(move || {
+                for _ in 0..100 {
+                    if let Ok(s) = TcpStream::connect(addr) {
+                        connected.fetch_add(1, Ordering::SeqCst);
+                        let _ = s.shutdown(Shutdown::Both);
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    // Connections still waiting in the listen backlog are admitted (or refused)
+    // after the clients are gone: wait until every successful connect has been
+    // handled and all slots are back, otherwise a zero reading can be transient.
+    let total = connected.load(Ordering::SeqCst);
+    wait_until("every connection handled and all slots released", || {
+        let s = r.snapshot();
+        s.connections_accepted + s.connections_rejected >= total && s.active_connections == 0
+    });
+    assert!(r.snapshot().peak_connections <= 4);
+    let c = r.authed(); // a new client is still admitted
+    drop(c);
+}

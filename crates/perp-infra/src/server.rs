@@ -226,8 +226,7 @@ pub struct ServerStats {
 struct SharedStats {
     accepted: AtomicU64,
     rejected: AtomicU64,
-    active: AtomicU64,
-    peak: AtomicU64,
+    gate: ConnectionGate,
     requests: AtomicU64,
     auth_successes: AtomicU64,
     auth_failures: AtomicU64,
@@ -243,14 +242,63 @@ fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Counts open connections against a cap. Slots are reserved with a
+/// compare-and-swap loop, so concurrent releases are never lost and the count
+/// never exceeds the cap, even transiently.
+#[derive(Default)]
+struct ConnectionGate {
+    active: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl ConnectionGate {
+    /// Reserve a slot if fewer than `max` are in use.
+    fn try_acquire(&self, max: u64) -> bool {
+        let mut cur = self.active.load(Ordering::Relaxed);
+        loop {
+            if cur >= max {
+                return false;
+            }
+            match self.active.compare_exchange_weak(
+                cur,
+                cur.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.peak
+                        .fetch_max(cur.saturating_add(1), Ordering::Relaxed);
+                    return true;
+                }
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Give a reserved slot back (saturating at zero).
+    fn release(&self) {
+        let _ = self
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| v.checked_sub(1));
+    }
+
+    fn active(&self) -> u64 {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
 impl SharedStats {
     fn snapshot(&self) -> ServerStats {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         ServerStats {
             connections_accepted: get(&self.accepted),
             connections_rejected: get(&self.rejected),
-            active_connections: get(&self.active),
-            peak_connections: get(&self.peak),
+            active_connections: self.gate.active(),
+            peak_connections: self.gate.peak(),
             requests: get(&self.requests),
             auth_successes: get(&self.auth_successes),
             auth_failures: get(&self.auth_failures),
@@ -432,13 +480,13 @@ struct Shared {
     tx: SyncSender<Job>,
 }
 
-/// Decrements the active-connection gauge when the connection thread ends (or
-/// fails to start).
+/// Releases the connection slot when the connection thread ends (or fails to
+/// start).
 struct ActiveGuard(Arc<SharedStats>);
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::Relaxed);
+        self.0.gate.release();
     }
 }
 
@@ -883,9 +931,8 @@ fn admit(
         inc(&stats.rejected);
         return;
     }
-    let active = stats.active.load(Ordering::Relaxed);
     let cap = u64::try_from(shared.cfg.max_connections).unwrap_or(u64::MAX);
-    if active >= cap {
+    if !stats.gate.try_acquire(cap) {
         inc(&stats.rejected);
         let _ = send_line(
             &mut stream,
@@ -894,9 +941,6 @@ fn admit(
         );
         return;
     }
-    let now_active = active.saturating_add(1);
-    stats.active.store(now_active, Ordering::Relaxed);
-    stats.peak.fetch_max(now_active, Ordering::Relaxed);
     let guard = ActiveGuard(Arc::clone(stats));
     let sh = Arc::clone(shared);
     let spawned = thread::Builder::new()
@@ -941,6 +985,47 @@ mod tests {
         let mut c = ServerConfig::new(token());
         c.listen = "127.0.0.1:0".parse().unwrap();
         c
+    }
+
+    #[test]
+    fn gate_never_exceeds_max_and_returns_to_zero_under_churn() {
+        let gate = Arc::new(ConnectionGate::default());
+        let over = Arc::new(AtomicBool::new(false));
+        let mut hs = Vec::new();
+        for _ in 0..8 {
+            let (g, o) = (Arc::clone(&gate), Arc::clone(&over));
+            hs.push(thread::spawn(move || {
+                for _ in 0..100_000 {
+                    if g.try_acquire(3) {
+                        if g.active() > 3 {
+                            o.store(true, Ordering::Relaxed);
+                        }
+                        g.release();
+                    }
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert!(!over.load(Ordering::Relaxed));
+        assert_eq!(gate.active(), 0);
+        assert!(gate.peak() >= 1 && gate.peak() <= 3);
+    }
+
+    #[test]
+    fn gate_rolls_back_a_refused_acquire() {
+        let gate = ConnectionGate::default();
+        assert!(gate.try_acquire(2));
+        assert!(gate.try_acquire(2));
+        assert!(!gate.try_acquire(2));
+        assert!(!gate.try_acquire(2));
+        assert_eq!(gate.active(), 2);
+        assert_eq!(gate.peak(), 2);
+        gate.release();
+        assert_eq!(gate.active(), 1);
+        assert!(gate.try_acquire(2));
+        assert!(!ConnectionGate::default().try_acquire(0));
     }
 
     #[test]
