@@ -1,0 +1,11 @@
+/target
+.env
+.env.*
+*.pem
+*.key
+.agent-undo
+*.wal
+*.snap
+*.token
+.DS_Store
+.scratch*/

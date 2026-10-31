@@ -1,0 +1,37 @@
+[package]
+name = "perp-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Educational deterministic perpetual-futures exchange core: matching, margin, funding, liquidation, crash-safe log. Not for real funds."
+readme = "README.md"
+repository = "https://github.com/kienpt91/perp-engine"
+publish = false
+
+[lib]
+name = "perp_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "perp-engine"
+path = "src/main.rs"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+overflow-checks = true
+debug-assertions = false
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
+
+[profile.dev]
+overflow-checks = true
