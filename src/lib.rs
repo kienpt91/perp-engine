@@ -7,3 +7,5 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)
 )]
 #![warn(missing_docs)]
+pub mod error;
+pub mod fixed;
