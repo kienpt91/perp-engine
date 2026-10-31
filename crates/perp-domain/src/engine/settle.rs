@@ -133,12 +133,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Queue an account for a maintenance-margin check if it has positions.
+    /// Queue an account for a maintenance-margin check if it has positions, or a
+    /// shortfall to cover if it ended flat with negative collateral.
     pub(super) fn mark_dirty(&mut self, account: AccountId) {
         if self
             .accounts
             .get(&account)
-            .is_some_and(|a| !a.positions.is_empty())
+            .is_some_and(|a| !a.positions.is_empty() || a.collateral < 0)
         {
             self.pending_liq.insert(account);
         }
