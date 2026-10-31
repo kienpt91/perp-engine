@@ -160,6 +160,21 @@ impl EngineConfig {
                 return Err(Error::InvalidConfig("rebate exceeds taker fee"));
             }
         }
+        // A rebate may be paid to a maker facing a taker from any tier, so it
+        // must not exceed the lowest taker fee: the fee pool can never go negative.
+        let min_taker = self
+            .fee_tiers
+            .iter()
+            .map(|t| t.taker_ppm)
+            .min()
+            .unwrap_or(0);
+        if self
+            .fee_tiers
+            .iter()
+            .any(|t| t.maker_ppm < 0 && t.maker_ppm.unsigned_abs() > min_taker)
+        {
+            return Err(Error::InvalidConfig("rebate exceeds lowest taker fee"));
+        }
         Ok(())
     }
 }
@@ -304,7 +319,7 @@ impl MarketConfig {
         }
         if self.max_order_qty < self.lot
             || self.max_order_qty > MAX_QTY
-            || self.max_order_qty % self.lot != 0
+            || !self.max_order_qty.is_multiple_of(self.lot)
         {
             return bad("max_order_qty");
         }
@@ -1057,7 +1072,11 @@ impl Decode for Event {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default
+)]
 mod tests {
     use super::*;
     use crate::codec::{from_bytes, to_bytes};
