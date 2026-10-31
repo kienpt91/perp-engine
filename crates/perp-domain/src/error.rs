@@ -142,3 +142,69 @@ impl std::error::Error for Error {}
 
 /// Result alias used across the engine.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn all() -> Vec<Error> {
+        vec![
+            Error::Overflow,
+            Error::DivisionByZero,
+            Error::NotConfigured,
+            Error::AlreadyConfigured,
+            Error::InvalidConfig("x"),
+            Error::UnknownMarket,
+            Error::MarketExists,
+            Error::TooManyMarkets,
+            Error::UnknownAccount,
+            Error::TooManyAccounts,
+            Error::UnknownOrder,
+            Error::DuplicateClientOrderId,
+            Error::TooManyOrders,
+            Error::BookFull,
+            Error::ZeroAmount,
+            Error::AmountTooLarge,
+            Error::ZeroQty,
+            Error::InvalidQty,
+            Error::InvalidPrice,
+            Error::BelowMinNotional,
+            Error::InvalidSlippage,
+            Error::WouldCross,
+            Error::FokNotFillable,
+            Error::NoLiquidity,
+            Error::ReduceOnlyViolation,
+            Error::MarginBreach,
+            Error::PositionLimit,
+            Error::InsufficientCollateral,
+            Error::NoMarkPrice,
+            Error::StaleOracle,
+            Error::OracleRegression,
+            Error::OracleBadPrice,
+            Error::TimeRegression,
+            Error::UnknownFeeTier,
+            Error::Halted,
+            Error::Internal("y"),
+        ]
+    }
+
+    #[test]
+    fn every_error_has_a_unique_snake_case_code() {
+        let codes: BTreeSet<&str> = all().iter().map(Error::code).collect();
+        assert_eq!(codes.len(), all().len());
+        assert!(codes
+            .iter()
+            .all(|c| c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+    }
+
+    #[test]
+    fn display_is_the_code_and_adds_detail_only_where_there_is_one() {
+        assert_eq!(Error::MarginBreach.to_string(), "margin_breach");
+        assert_eq!(
+            Error::InvalidConfig("tick").to_string(),
+            "invalid_config: tick"
+        );
+        assert_eq!(Error::Internal("boom").to_string(), "internal: boom");
+    }
+}
