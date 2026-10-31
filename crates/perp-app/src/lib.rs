@@ -22,7 +22,8 @@
 #![warn(missing_docs)]
 
 pub mod api;
-pub mod ports;
-pub mod fakes;
 pub mod contract;
+pub mod fakes;
+pub mod ports;
 pub mod service;
+pub mod simulation;
