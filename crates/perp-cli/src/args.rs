@@ -13,7 +13,7 @@ pub struct Args {
 }
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["init", "allow-non-loopback", "strict", "help"];
+const SWITCHES: &[&str] = &["init", "allow-non-loopback", "strict", "repair", "help"];
 
 impl Args {
     /// Parse arguments (without the program name). `--key=value` is accepted.

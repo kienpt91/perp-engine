@@ -592,3 +592,19 @@ fn server_accepts_the_token_from_an_environment_variable_only() {
         "server output must never contain the token"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_argument_is_a_usage_error_not_a_panic() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let out = bin()
+        .arg("replay")
+        .arg(OsString::from_vec(vec![0x66, 0xff, 0xfe]))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("argument 2 is not valid UTF-8"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+}

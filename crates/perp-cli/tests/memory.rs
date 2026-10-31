@@ -49,6 +49,7 @@ fn resident_memory_plateaus_during_a_long_simulation() {
     let cfg = ServiceConfig {
         snapshot_every: 0,
         keep_snapshots: 1,
+        ..ServiceConfig::default()
     };
     let (mut svc, _) = ExchangeService::open(log, snaps, SystemClock, cfg).unwrap();
     let sim = SimulationConfig {
@@ -177,6 +178,7 @@ fn resident_memory_plateaus_with_books_filled_to_their_limits() {
         ServiceConfig {
             snapshot_every: 0,
             keep_snapshots: 1,
+            ..ServiceConfig::default()
         },
     )
     .unwrap();

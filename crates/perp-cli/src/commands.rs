@@ -113,6 +113,7 @@ fn simulate(args: &Args, out: &mut dyn Write) -> CliResult {
     let service_cfg = ServiceConfig {
         snapshot_every: args.number("snapshot-every", 0).map_err(usage)?,
         keep_snapshots: 3,
+        ..ServiceConfig::default()
     };
     let fsync = parse_fsync(args)?;
     let probe = ProcStatusProbe;
@@ -265,6 +266,23 @@ fn verify(args: &Args, out: &mut dyn Write) -> CliResult {
     )
     .map_err(w)?;
     writeln!(out, "torn tail             {} bytes", report.torn_bytes).map_err(w)?;
+    writeln!(
+        out,
+        "damaged tail          {}",
+        if report.damaged_tail {
+            "YES: the final record is complete but fails verification (serve --repair removes it)"
+        } else {
+            "no"
+        }
+    )
+    .map_err(w)?;
+    if report.damaged_tail && args.has("strict") {
+        return Err(CliError::Failure(
+            "the log ends with a complete but damaged record (it is NOT removed automatically; \
+             start serve with --repair to save it to a sidecar file and truncate)"
+                .into(),
+        ));
+    }
     if report.torn_bytes > 0 && args.has("strict") {
         return Err(CliError::Failure(
             "the log ends with a torn record (it is truncated when opened for append)".into(),
@@ -353,6 +371,8 @@ fn serve(args: &Args, err: &mut dyn Write) -> CliResult {
         "markets",
         "fsync",
         "snapshot-every",
+        "repair",
+        "max-log-mib",
     ])
     .map_err(usage)?;
     if !args.positional.is_empty() {
@@ -383,17 +403,32 @@ fn serve(args: &Args, err: &mut dyn Write) -> CliResult {
     let service_cfg = ServiceConfig {
         snapshot_every: args.number("snapshot-every", 10_000).map_err(usage)?,
         keep_snapshots: 3,
+        ..ServiceConfig::default()
     };
+    let max_log_mib: u64 = args.number("max-log-mib", 1024).map_err(usage)?;
+    let max_file_bytes = max_log_mib
+        .checked_mul(1 << 20)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| usage("--max-log-mib must be at least 1 and fit in 64 bits of bytes"))?;
 
     std::fs::create_dir_all(&dir).map_err(fail("create --dir"))?;
     let log = FileEventLog::open(
         dir.join("engine.wal"),
         WalConfig {
             fsync,
-            ..WalConfig::default()
+            max_file_bytes,
+            repair_damaged_tail: args.has("repair"),
         },
     )
     .map_err(fail("open log"))?;
+    if let Some(side) = log.sidecar() {
+        let _ = writeln!(
+            err,
+            "warning: {} bytes dropped from the log tail were saved to {}",
+            log.repaired_bytes(),
+            side.display()
+        );
+    }
     let snaps = FileSnapshotStore::new(dir.join("snapshots"));
     let (mut svc, rec) =
         ExchangeService::open(log, snaps, SystemClock, service_cfg).map_err(fail("recover"))?;

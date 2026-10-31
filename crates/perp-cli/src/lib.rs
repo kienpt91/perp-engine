@@ -37,6 +37,7 @@ USAGE:
   perp-engine serve --dir DIR [--listen ADDR] [--token-env NAME | --token-file PATH]
                     [--allow-non-loopback] [--init] [--markets N]
                     [--fsync always|every:N|never] [--snapshot-every N]
+                    [--max-log-mib N] [--repair]
   perp-engine gen-token [--out FILE]        create a random auth token (never logged)
   perp-engine help
 
@@ -57,6 +58,17 @@ pub enum CliError {
     Usage(String),
     /// The command ran and failed.
     Failure(String),
+}
+
+/// Convert raw OS arguments to strings. On failure returns the 1-based index
+/// of the first argument that is not valid UTF-8 (the bytes are never echoed).
+pub fn args_from_os(
+    argv: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Vec<String>, usize> {
+    argv.into_iter()
+        .enumerate()
+        .map(|(i, a)| a.into_string().map_err(|_| i.saturating_add(1)))
+        .collect()
 }
 
 /// Run the command line. Returns the process exit code.
@@ -83,4 +95,25 @@ fn usage_error(err: &mut dyn Write, msg: &str) -> i32 {
     let _ = writeln!(err, "error: {msg}\n");
     let _ = err.write_all(USAGE.as_bytes());
     EXIT_USAGE
+}
+#[cfg(test)]
+mod os_args_tests {
+    use super::args_from_os;
+    use std::ffi::OsString;
+
+    #[test]
+    fn valid_arguments_convert() {
+        let v = args_from_os(["a", "b"].map(OsString::from)).unwrap();
+        assert_eq!(v, vec!["a".to_string(), "b".to_string()]);
+        assert!(args_from_os(Vec::new()).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_invalid_argument_is_reported_by_position() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0x66, 0xff, 0xfe]);
+        let r = args_from_os(vec![OsString::from("ok"), bad.clone(), bad]);
+        assert_eq!(r, Err(2));
+    }
 }
