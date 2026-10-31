@@ -14,9 +14,11 @@
 )]
 #![warn(missing_docs)]
 
+pub mod clock;
 pub mod json;
-pub mod token;
+pub mod probe;
 pub mod protocol;
 pub mod server;
-pub mod wal;
 pub mod snapshot;
+pub mod token;
+pub mod wal;
