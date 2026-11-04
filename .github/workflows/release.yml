@@ -1,0 +1,100 @@
+name: release
+
+# A push of a tag v* verifies the code, builds the distributable, writes SHA256SUMS, attests where the files
+# came from and creates the GitHub release. workflow_dispatch only builds and keeps the files as a workflow
+# artifact; it never creates a release. Nothing is published to a package registry.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag must name the manifest version and be in the history of the default branch
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: sh scripts/check-release-tag.sh "$TAG"
+      - name: Release scripts
+        run: sh scripts/test-release.sh
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fetch --locked
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fetch --locked
+      - run: cargo build --release --locked
+      - name: Package the linux x86_64 binary and checksum it
+        run: |
+          test "$(uname -m)" = x86_64
+          version=$(sh scripts/manifest-version.sh)
+          dir=perp-engine-$version-x86_64-unknown-linux-gnu
+          mkdir -p "stage/$dir" release
+          cp "target/release/perp-engine" LICENSE README.md "stage/$dir/"
+          tar -C stage --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$(git log -1 --format=%ct)" -cf - "$dir" | gzip -n > "release/$dir.tar.gz"
+          cd release
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attest the build provenance of the files
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*
+      - name: Create the GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sh scripts/release-notes.sh "$TAG" > "$RUNNER_TEMP/release-notes.txt"
+          flags=""
+          case "$TAG" in *-*) flags="--prerelease" ;; esac
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/release-notes.txt" $flags release/*
+      - name: Keep the build (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-build
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
