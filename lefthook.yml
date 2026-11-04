@@ -7,3 +7,8 @@ pre-push:
   commands:
     secret-scan:
       run: sh scripts/secret-scan.sh --tree
+
+commit-msg:
+  commands:
+    message-guard:
+      run: sh scripts/check-commit-msg.sh {1}
