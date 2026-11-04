@@ -463,6 +463,10 @@ CI additionally scans the full history. The scanner is a dependency-free shell s
 
 If a secret is ever committed, rotate it first (treat it as compromised), then remove it from history.
 
+## Releasing
+
+Releases are cut by pushing a `vMAJOR.MINOR.PATCH` tag. The `release` workflow then verifies the code, builds the files, writes `SHA256SUMS`, attests where they were built and creates the GitHub release. See [RELEASING.md](RELEASING.md) for how to cut a release and how to verify a download with `gh attestation verify`.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
